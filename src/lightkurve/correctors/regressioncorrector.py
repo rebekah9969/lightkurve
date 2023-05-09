@@ -87,25 +87,30 @@ class RegressionCorrector(Corrector):
 
     def __init__(self, lc):
         # We don't accept NaN in time or flux.
-        if np.any([~np.isfinite(lc.time.value), ~np.isfinite(lc.flux)]):
-            raise ValueError(
-                "Input light curve has NaNs in time or flux. "
-                "Please remove NaNs before correction "
-                "(e.g. using `lc = lc.remove_nans()`)."
-            )
+
+        nan_mask = np.isnan(lc.flux) | np.isnan(lc.flux_err) | np.isnan(lc.time.value)
+        #if np.any([~np.isfinite(lc.time.value), ~np.isfinite(lc.flux)]):
+        #    raise ValueError(
+        #        "Input light curve has NaNs in time or flux. "
+        #        "Please remove NaNs before correction "
+        #        "(e.g. using `lc = lc.remove_nans()`)."
+        #    )
         # We don't accept NaN in flux_err, unless all values are NaN.
-        if np.any(~np.isfinite(lc.flux_err)) and not np.all(~np.isfinite(lc.flux_err)):
-            raise ValueError(
-                "Input light curve has NaNs in `flux_err`. "
-                "Please remove NaNs before correction "
-                "(e.g. using `lc = lc.remove_nans()`)."
-            )
-        if np.any(lc.flux_err[np.isfinite(lc.flux_err)] <= 0):
-            raise ValueError(
-                "Input light curve contains flux uncertainties "
-                "smaller than or equal to zero. Please remove "
-                "these (e.g. using `lc = lc[lc.flux_err > 0]`)."
-            )
+        #if np.any(~np.isfinite(lc.flux_err)) and not np.all(~np.isfinite(lc.flux_err)):
+        #    raise ValueError(
+        #        "Input light curve has NaNs in `flux_err`. "
+        #        "Please remove NaNs before correction "
+        #        "(e.g. using `lc = lc.remove_nans()`)."
+        #    )
+        #if np.any(lc.flux_err[np.isfinite(lc.flux_err)] <= 0):
+        #    raise ValueError(
+        #        "Input light curve contains flux uncertainties "
+        #        "smaller than or equal to zero. Please remove "
+        #        "these (e.g. using `lc = lc[lc.flux_err > 0]`)."
+        #    )
+
+        lc = lc[~nan_mask]
+        
         self.lc = lc
 
         # The following properties will be set when correct() is called.
