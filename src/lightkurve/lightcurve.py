@@ -2679,12 +2679,15 @@ class LightCurve(TimeSeries):
                             array=extra_data[kw],
                         )
                     )
-            if "SAP_QUALITY" not in extra_data:
-                cols.append(
-                    fits.Column(
-                        name="SAP_QUALITY", format="J", array=np.zeros(len(self.flux))
-                    )
-                )
+
+            #Editing this out as we do not want this column to show up for generic data
+            #Testing to see if removing this breaks anything
+            #if "SAP_QUALITY" not in extra_data:
+            #    cols.append(
+            #        fits.Column(
+            #            name="SAP_QUALITY", format="J", array=np.zeros(len(self.flux))
+            #        )
+            #    )
             coldefs = fits.ColDefs(cols)
             hdu = fits.BinTableHDU.from_columns(coldefs)
             hdu.header["EXTNAME"] = "LIGHTCURVE"
