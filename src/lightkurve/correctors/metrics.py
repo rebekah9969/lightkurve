@@ -6,10 +6,13 @@ under- or over-fitted.  These features were contributed by Jeff Smith (cf. https
 and are in turn inspired by similar metrics in use by the PDC module of the official Kepler/TESS pipeline.
 """
 import logging
+import copy
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 from memoization import cached
+from astropy import units as u
+from typing import Union
 
 from .. import LightCurve
 
@@ -127,6 +130,7 @@ def underfit_metric_neighbors(
     max_targets: int = 50,
     interpolate: bool = False,
     extrapolate: bool = False,
+    quality_bitmask: Union[int, str] = "default",
 ):
     """This goodness metric measures the degree of under-fitting of the
     CBVs to the light curve. It does so by measuring the mean residual target to
@@ -143,7 +147,7 @@ def underfit_metric_neighbors(
     interpolated to the corrected_lc cadence times. extrapolate=True will 
     further extrapolate the targets to the corrected_lc cadence times.
 
-    The returned under-fitting goodness metric is callibrated such that a
+    The returned under-fitting goodness metric is calibrated such that a
     value of 0.95 means the residual correlations in the target is
     equivalent to chance correlations of White Gaussian Noise.
 
@@ -170,6 +174,12 @@ def underfit_metric_neighbors(
     under_fitting_metric : float
         A float in the range [0,1] where 0 => Bad, 1 => Good
     """
+
+    # Normalize and condition the corrected light curve
+    corrected_lc = corrected_lc.copy().remove_nans().normalize()
+    corrected_lc -= 1.0
+    corrected_lc_flux = corrected_lc.flux.value
+
     # Download and pre-process neighboring light curves
     lc_neighborhood, lc_neighborhood_flux = _download_and_preprocess_neighbors(
         corrected_lc=corrected_lc,
@@ -179,32 +189,24 @@ def underfit_metric_neighbors(
         interpolate=interpolate,
         extrapolate=extrapolate,
         flux_column="sap_flux",
+        quality_bitmask=quality_bitmask,
     )
 
-    # If there happens to be any cadences in the corrected_lc
-    # that are not in the neighboring targets then those need to
-    # be removed.
-    # If we interpolated the CBVs then this should not occur
-    # Also normalize
-    corrected_lc = corrected_lc.copy().remove_nans().normalize()
-    corrected_lc -= 1.0
-    if interpolate:
-        corrected_lc_flux_trimmed = corrected_lc.flux.value
-    else:
-        corrected_lc_trim_mask = np.in1d(corrected_lc.cadenceno, 
-                lc_neighborhood[0].cadenceno)
-        corrected_lc_flux_trimmed = corrected_lc.flux.value[corrected_lc_trim_mask]
-
     # Create fluxMatrix. The last entry is the target under study
+    # Check that all neighboring targets have similar shape
+    if not np.all([len(lc_neighborhood_flux[0]) == len(l) for l in lc_neighborhood_flux]):
+        raise Exception('Neighbroing targets do not all have the same shape')
     fluxMatrix = np.zeros((len(lc_neighborhood_flux[0]), len(lc_neighborhood_flux) + 1))
     for idx in np.arange(len(fluxMatrix[0, :]) - 1):
         fluxMatrix[:, idx] = lc_neighborhood_flux[idx]
     # Add in the trimmed target under study
-    fluxMatrix[:, -1] = corrected_lc_flux_trimmed
+    fluxMatrix[:, -1] = corrected_lc_flux
 
-    # Ignore NaNs
-    mask = ~np.isnan(corrected_lc_flux_trimmed)
-    fluxMatrix = fluxMatrix[mask, :]
+    # Remove NaNs from any flux column
+    mask = np.zeros(fluxMatrix.shape[0], dtype=bool)
+    for i in range(fluxMatrix.shape[1]):
+        mask |= np.isnan(fluxMatrix[:, i])
+    fluxMatrix = fluxMatrix[~mask, :]
 
     # Determine the target-target correlation between target and
     # neighborhood
@@ -212,7 +214,7 @@ def underfit_metric_neighbors(
 
     # The selection basis for targets used for the PDC-MAP SVD  uses median
     # absolute correlation per star.  However, here we wish to overemphasize
-    # any residual correlation between a handfull of targets and not the
+    # any residual correlation between a handful of targets and not the
     # overall correlation (which should almost always be low).
 
     # We want a residual correlation larger than random correlations of WGN
@@ -267,10 +269,11 @@ def _unique_key_for_processing_neighbors(
     extrapolate: bool = False,
     author: tuple = ("Kepler", "K2", "SPOC"),
     flux_column: str = "sap_flux",
+    quality_bitmask: Union[str,int] = "default",
 ):
     """Returns a unique key that will determine whether a cached version of a
     call to `_download_and_preprocess_neighbors` can be re-used."""
-    return f"{corrected_lc.ra}{corrected_lc.dec}{corrected_lc.cadenceno}{radius}{min_targets}{max_targets}{author}{flux_column}{interpolate}"
+    return f"{corrected_lc.ra}{corrected_lc.dec}{corrected_lc.cadenceno}{radius}{min_targets}{max_targets}{author}{flux_column}{interpolate}{quality_bitmask}"
 
 
 @cached(custom_key_maker=_unique_key_for_processing_neighbors)
@@ -283,6 +286,7 @@ def _download_and_preprocess_neighbors(
     extrapolate: bool = False,
     author: tuple = ("Kepler", "K2", "SPOC"),
     flux_column: str = "sap_flux",
+    quality_bitmask: Union[str, int] = "default",
 ):
     """Returns a collection of neighboring light curves.
 
@@ -321,7 +325,7 @@ def _download_and_preprocess_neighbors(
         raise Exception('interpolate must be True if extrapolate is True')
 
     search = corrected_lc.search_neighbors(
-        limit=max_targets, radius=radius, author=author
+        limit=max_targets, radius=radius, author=author,
     )
     if len(search) < min_targets:
         raise MinTargetsError(
@@ -330,15 +334,16 @@ def _download_and_preprocess_neighbors(
     log.info(
         f"Downloading {len(search)} neighboring light curves. This might take a while."
     )
-    lcfCol = search.download_all(flux_column=flux_column)
+    lcfCol = search.download_all(flux_column=flux_column, quality_bitmask=quality_bitmask)
 
     # Pre-process the neighboring light curves
+    # Align or interpolate to the corrected light curve
     lc_neighborhood = []
     lc_neighborhood_flux = []
     # Extract SAP light curves
     # We want zero-centered median normalized light curves
     for lc in lcfCol:
-        lcSAP = lc.remove_nans().normalize()
+        lcSAP = lc.remove_nans(column=flux_column).normalize()
         lcSAP.flux -= 1.0
         # Align or interpolate the neighboring target with the target under study
         if interpolate:
@@ -352,13 +357,9 @@ def _download_and_preprocess_neighbors(
         else:
             # The CBVs were aligned so also align the neighboring
             # lightcurves
-            lc_trim_mask = np.in1d(
-                lcSAP.cadenceno, corrected_lc.cadenceno
-            )
-            # If there are no non-trimmed cadences then nothing to add
-            if (np.all(np.logical_not(lc_trim_mask))):
-                continue
-            lc_neighborhood_flux.append(lcSAP[lc_trim_mask].flux.value)
+            aligned_lcSAP = _align_to_lc(lcSAP, corrected_lc)
+            lc_neighborhood_flux.append(aligned_lcSAP.flux.value)
+
         lc_neighborhood.append(lcSAP)
 
     if len(lc_neighborhood) < min_targets:
@@ -373,6 +374,78 @@ def _download_and_preprocess_neighbors(
     lc_neighborhood_flux = lc_neighborhood_flux
 
     return lc_neighborhood, lc_neighborhood_flux
+
+def _align_to_lc(lc, ref_lc):
+    """ Aligns a light curve to a reference light curve.
+
+    This method will use the cadence number (lc.cadenceno) to
+    perform the synchronization. Only cadence numbers that exist in both
+    the lc and the ref_lc will have values in the returned lc. All
+    cadence numbers that exist in ref_lc but not in lc will
+    have NaNs returned for those cadences.
+
+    Any cadences in the lc not in ref_lc will be removed from the returned lc.
+
+    The returned lc is sorted by cadenceno.
+
+    Parameters
+    ----------
+    lc : LightCurve object
+        The light curve to align
+    ref_lc : LightCurve object
+        The reference light curve to align to
+
+    Returns
+    -------
+    lc : LightCurve object
+        The light curve aligned to ref_lc
+    """
+
+    if not isinstance(lc, LightCurve):
+        raise Exception('<lc> must be a LightCurve class')
+    if not isinstance(ref_lc, LightCurve):
+        raise Exception('<ref_lc> must be a LightCurve class')
+
+    if hasattr(lc, 'cadenceno'):
+
+        # Make a deepcopy so we do not just return a modified original
+        aligned_lc = copy.deepcopy(lc)
+
+        # NaN any cadences in ref_lc and not lc
+        # This requires us to add rows to the lc table
+        lc_nan_mask = np.logical_not(np.isin(ref_lc.cadenceno, aligned_lc.cadenceno))
+        lc_nan_indices = np.nonzero(lc_nan_mask)[0]
+        if len(lc_nan_indices) > 0:
+            row_to_add = LightCurve(aligned_lc[0:len(lc_nan_indices)])
+            row_to_add['time'] = ref_lc.time[lc_nan_indices]
+            row_to_add['cadenceno'] = ref_lc.cadenceno[lc_nan_indices]
+            row_to_add['flux'] = np.nan
+            aligned_lc = aligned_lc.append(row_to_add)
+
+        # There appears to be a bug in astropy.timeseries when using ts[x:y]
+        # in combination with ts.remove_row() or ts.remove_rows.
+        # See LightKurve Issue #836.
+        # To get around the error for now, we will attempt to use
+        # ts[x:y]. If it errors out then revert to remove_rows, which is
+        # REALLY slow.
+        try:
+            # This method is fast but might cause errors
+            keep_indices = np.nonzero(np.isin(aligned_lc.cadenceno, ref_lc.cadenceno))[0]
+            aligned_lc = aligned_lc[keep_indices]
+        except:
+            # This method is slow but appears to be more robust
+            trim_indices = np.nonzero(np.logical_not(
+                np.isin(aligned_lc.cadenceno, ref_lc.cadenceno)))[0]
+            aligned_lc.remove_rows(trim_indices)
+
+        # Now sort the lc by cadenceno
+        aligned_lc.sort('cadenceno')
+
+    else:
+        raise Exception('align requires cadence numbers for the ' + \
+                'light curve. NO ALIGNMENT OCCURRED')
+
+    return aligned_lc
 
 
 def _compute_correlation(fluxMatrix):

@@ -7,6 +7,7 @@ by consensus. If you believe you meet the criteria to be added as a core
 developer, please open an issue!
 
 - `Geert Barentsen <https://github.com/barentsen>`_ (lead maintainer)
+- `Sam Lee <https://github.com/orionlee>`_
 - `Christina Hedges <https://github.com/christinahedges>`_
 - `José Vinícius de Miranda Cardoso <https://github.com/mirca>`_
 - `Thomas Barclay <https://github.com/mrtommyb>`_
@@ -16,7 +17,8 @@ developer, please open an issue!
 - `Michael Gully-Santiago <https://github.com/gully>`_
 - `Daniel Hey <https://github.com/danielhey>`_
 - `Oliver Hall <https://github.com/ojhall94>`_
-
+- `Nicole Schance <https://github.com/Nschanche>`_
+- `Tyler Pritchard <https://github.com/tylerapritchard>`_
 
 
 Contributors
@@ -42,7 +44,6 @@ The following GitHub members directly contributed code and bugfixes:
 - `Isabel Coleman <https://github.com/astrobel>`_
 - `Colin J. Burke <https://github.com/burke86>`_
 - `Andrew Vanderburg <https://github.com/avanderburg>`_
-- `Sam Lee <https://github.com/orionlee>`_
 - `Stephanie Douglas <https://github.com/stephtdouglas>`_
 - `Kaiming Cui <https://github.com/ckm3>`_
 - `Nuno Ramos Carvalho <https://github.com/nunorc>`_
@@ -51,6 +52,15 @@ The following GitHub members directly contributed code and bugfixes:
 - `Susan Mullally <https://github.com/mustaric>`_
 - `Jorge Martínez-Palomera <https://github.com/jorgemarpa>`_
 - `Warrick Ball <https://github.com/warrickball>`_
+- `Isaac Yong <https://github.com/isaac-yong0804>`_
+- `Gutsycat <https://github.com/Sniperq2>`_
+- `Jennifer V Medina <https://github.com/jaymedina>`_
+- `Keyu Xing <https://github.com/keyuxing>`_
+- `Lieven Govaerts <https://github.com/lgov>`_
+- `DeepekshGupta <https://github.com/DeepekshGupta>`_
+- `vvilhelmus <https://github.com/vvilhelmus>`_
+- `vbkostov <https://github.com/vbkostov>`_
+- `Sam Bianco <https://github.com/snbianco>`_
 
 
 Community

@@ -17,13 +17,8 @@ from astropy.units import cds
 from astropy.convolution import convolve, Box1DKernel
 from astropy.time import Time
 
-# LombScargle was moved from astropy.stats to astropy.timeseries in AstroPy v3.2
-try:
-    from astropy.timeseries import LombScargle
-    from astropy.timeseries import implementations  # for .main._is_regular
-except ImportError:
-    from astropy.stats import LombScargle
-    from astropy.stats.lombscargle import implementations
+from astropy.timeseries import BoxLeastSquares, LombScargle
+from astropy.timeseries.periodograms.lombscargle import implementations  # for .main._is_regular
 
 
 from . import MPLSTYLE
@@ -655,7 +650,8 @@ class LombScarglePeriodogram(Periodogram):
         ls_method="fast",
         **kwargs
     ):
-        """Creates a `Periodogram` from a LightCurve using the Lomb-Scargle method.
+        """Creates a `Periodogram` from a LightCurve using the Lomb-Scargle method in
+        `astropy`'s `~astropy.timeseries.LombScargle`.
 
         By default, the periodogram will be created for a regular grid of
         frequencies from one frequency separation to the Nyquist frequency,
@@ -773,9 +769,11 @@ class LombScarglePeriodogram(Periodogram):
             (`'amplitude'`).
         ls_method : str
             Default: `'fast'`. Passed to the `method` keyword of
-            `astropy.stats.LombScargle()`.
+            `astropy.timeseries.LombScargle()`.
         kwargs : dict
-            Keyword arguments passed to `astropy.stats.LombScargle()`
+            Keyword arguments passed to
+            `LombScargle() <astropy.timeseries.LombScargle>`
+
 
         Returns
         -------
@@ -784,7 +782,7 @@ class LombScarglePeriodogram(Periodogram):
         """
         # Input validation
         normalization = validate_method(normalization, ["psd", "amplitude"])
-        if np.isnan(lc.flux).any():
+        if np.isnan(lc.flux).any() or (hasattr(lc.flux, 'unmasked') and np.isnan(lc.flux.unmasked).any()):
             lc = lc.remove_nans()
             log.debug(
                 "Lightcurve contains NaN values."
@@ -1024,7 +1022,8 @@ class BoxLeastSquaresPeriodogram(Periodogram):
 
     @staticmethod
     def from_lightcurve(lc, **kwargs):
-        """Creates a `Periodogram` from a LightCurve using the Box Least Squares (BLS) method.
+        """Creates a `Periodogram` from a LightCurve using the Box Least Squares (BLS) method
+        in `astropy`'s `~astropy.timeseries.BoxLeastSquares`.
 
         Parameters
         ----------
@@ -1071,16 +1070,6 @@ class BoxLeastSquaresPeriodogram(Periodogram):
         ensuring that any systems with at least 3 transits are within the range of searched periods.
 
         """
-        # BoxLeastSquares was added to `astropy.stats` in AstroPy v3.1 and then
-        # moved to `astropy.timeseries` in v3.2, which makes the import below
-        # somewhat complicated.
-        try:
-            from astropy.timeseries import BoxLeastSquares
-        except ImportError:
-            try:
-                from astropy.stats import BoxLeastSquares
-            except ImportError:
-                raise ImportError("BLS requires AstroPy v3.1 or later")
 
         # Validate user input for `lc`
         # (BoxLeastSquares will not work if flux or flux_err contain NaNs)
@@ -1186,7 +1175,7 @@ class BoxLeastSquaresPeriodogram(Periodogram):
     def compute_stats(self, period=None, duration=None, transit_time=None):
         """Computes commonly used vetting statistics for a transit model.
 
-        See astropy.stats.bls docs for further details.
+        See `~astropy.timeseries.BoxLeastSquares` docs for further details.
 
         Parameters
         ----------
@@ -1223,7 +1212,7 @@ class BoxLeastSquaresPeriodogram(Periodogram):
     def get_transit_model(self, period=None, duration=None, transit_time=None):
         """Computes the transit model using the BLS, returns a lightkurve.LightCurve
 
-        See astropy.stats.bls docs for further details.
+        See `~astropy.timeseries.BoxLeastSquares` docs for further details.
 
         Parameters
         ----------

@@ -3,9 +3,11 @@ import warnings
 
 from astropy.utils.data import get_pkg_data_filename
 import numpy as np
+from numpy.testing import assert_array_equal
 import pytest
 
 from lightkurve import LightkurveWarning, LightkurveError
+from lightkurve.search import search_targetpixelfile
 from lightkurve.targetpixelfile import KeplerTargetPixelFile, TessTargetPixelFile
 from .test_targetpixelfile import filename_tpf_tabby_lite
 from lightkurve.interact import get_lightcurve_y_limits
@@ -48,10 +50,6 @@ def test_malformed_notebook_url():
     with pytest.raises(ValueError) as exc:
         tpf.interact(notebook_url="")
     assert "Empty host value" in exc.value.args[0]
-    with pytest.raises(AttributeError) as exc:
-        tpf.interact(notebook_url=None)
-    assert "object has no attribute" in exc.value.args[0]
-
 
 @pytest.mark.skipif(bad_optional_imports, reason="requires bokeh")
 def test_graceful_exit_outside_notebook():
@@ -123,6 +121,7 @@ def test_interact_functions():
     from lightkurve.interact import (
         prepare_tpf_datasource,
         prepare_lightcurve_datasource,
+        aperture_mask_from_selected_indices,
         get_lightcurve_y_limits,
         make_lightcurve_figure_elements,
         make_tpf_figure_elements,
@@ -131,7 +130,25 @@ def test_interact_functions():
 
     tpf = TessTargetPixelFile(example_tpf)
     mask = tpf.flux[0, :, :] == tpf.flux[0, :, :]
+    # make the mask a bit more realistic
+    mask[0, 0] = False
+    mask[1, 2] = False
+
     tpf_source = prepare_tpf_datasource(tpf, aperture_mask=mask)
+
+    # https://github.com/lightkurve/lightkurve/issues/990
+    # ensure proper 2D - 1D conversion
+    assert tpf_source.data["xx"].ndim == 1
+    assert tpf_source.data["yy"].ndim == 1
+    # for bokeh v3, .indices needs to plain list .
+    # cf. https://github.com/bokeh/bokeh/issues/12624
+    assert isinstance(tpf_source.selected.indices, list)
+
+    # the lower-level function aperture_mask_from_selected_indices() is used in
+    # callback _create_lightcurve_from_pixels(), which cannot be easily tested.
+    # So we directly test it instead.
+    assert_array_equal(aperture_mask_from_selected_indices(tpf_source.selected.indices, tpf), mask)
+
     lc = tpf.to_lightcurve(aperture_mask=mask)
     lc_source = prepare_lightcurve_datasource(lc)
     get_lightcurve_y_limits(lc_source)
@@ -156,13 +173,14 @@ def test_interact_functions():
 
 @pytest.mark.remote_data
 @pytest.mark.skipif(bad_optional_imports, reason="requires bokeh")
-@pytest.mark.parametrize("tpf_class, tpf_file", [
-    (TessTargetPixelFile, example_tpf_tess),
-    (TessTargetPixelFile, example_tpf_tesscut),
-    (KeplerTargetPixelFile, example_tpf_kepler),
-    (TessTargetPixelFile, example_tpf_no_pm),
+@pytest.mark.filterwarnings("ignore:Proper motion correction cannot be applied to the target")  # for TESSCut
+@pytest.mark.parametrize("tpf_class, tpf_file, aperture_mask", [
+    (TessTargetPixelFile, example_tpf_tess, "pipeline"),
+    (TessTargetPixelFile, example_tpf_tesscut, "empty"),
+    (KeplerTargetPixelFile, example_tpf_kepler, "threshold"),
+    (TessTargetPixelFile, example_tpf_no_pm, "default"),
     ])
-def test_interact_sky_functions(tpf_class, tpf_file):
+def test_interact_sky_functions(tpf_class, tpf_file, aperture_mask):
     """Do the helper functions in the interact module run without syntax error?"""
     import bokeh
     from lightkurve.interact import (
@@ -171,9 +189,9 @@ def test_interact_sky_functions(tpf_class, tpf_file):
         add_gaia_figure_elements,
     )
     tpf = tpf_class(tpf_file)
-    mask = tpf.flux[0, :, :] == tpf.flux[0, :, :]
+    mask = tpf._parse_aperture_mask(aperture_mask)
     tpf_source = prepare_tpf_datasource(tpf, aperture_mask=mask)
-    fig1, slider1 = make_tpf_figure_elements(tpf, tpf_source)
+    fig1, slider1 = make_tpf_figure_elements(tpf, tpf_source, tpf_source_selectable=False)
     add_gaia_figure_elements(tpf, fig1)
     add_gaia_figure_elements(tpf, fig1, magnitude_limit=22)
 
@@ -195,6 +213,51 @@ def test_interact_sky_functions_case_no_target_coordinate():
     fig1, slider1 = make_tpf_figure_elements(tpf, tpf_source)
     with pytest.raises(LightkurveError, match=r".* no valid coordinate.*"):
         add_gaia_figure_elements(tpf, fig1)
+
+
+@pytest.mark.remote_data
+def test_interact_sky_functions_add_nearby_tics():
+    """Test the backend of interact_sky() that combine Nearby TIC report with Gaia result."""
+    from lightkurve.interact import (
+        _get_nearby_gaia_objects,
+        _add_nearby_tics_if_tess,
+    )
+    # This TIC's nearby report has a mix of stars with Gaia and without Gaia IDs.
+    # https://exofop.ipac.caltech.edu/tess/nearbytarget.php?id=233087860
+    tpf = search_targetpixelfile("TIC233087860", mission="TESS")[0].download()
+    magnitude_limit = 17
+
+    df_before = _get_nearby_gaia_objects(tpf, magnitude_limit)
+    df, source_colnames_extras, tooltips_extras = _add_nearby_tics_if_tess(tpf, magnitude_limit, df_before)
+
+    # based on what we know about the nearby report of the specific TIC,
+    # some existing Gaia entries are added with tic data
+    assert len(df[(df['Source'] > 0) & (df['tic'] != '')]) > 0
+
+    # Some new entries with data only from TIC nearby report are added (hence no Gaia info)
+    assert len(df[(df['Source'] == 0) & (df['tic'] != '')]) > 0
+
+
+@pytest.mark.remote_data
+def test_interact_sky_functions_add_nearby_tics_weird_dtype():
+    """Test the backend of interact_sky() that combine Nearby TIC report with Gaia result.
+    Case the dtype from Gaia result dataframe is weird.
+    """
+    from lightkurve.interact import (
+        _get_nearby_gaia_objects,
+        _add_nearby_tics_if_tess,
+    )
+    # For this TIC, the dataframe from Gaia search has weird DType:
+    # df['Source'].dtype is an instance of pd.Int64Dtype, not the type class itself.
+    # existing type check logic with np.issubdtype() fails with TypeError: Cannot interpret 'Int64Dtype()' as a data type
+    tpf = search_targetpixelfile("TIC135100529", mission="TESS")[0].download()
+    magnitude_limit = 18
+
+    df_before = _get_nearby_gaia_objects(tpf, magnitude_limit)
+    df, source_colnames_extras, tooltips_extras = _add_nearby_tics_if_tess(tpf, magnitude_limit, df_before)
+
+    # some TICs are added successfully, without any error raised.
+    assert len(df[df['tic'] != '']) > 0
 
 
 @pytest.mark.remote_data

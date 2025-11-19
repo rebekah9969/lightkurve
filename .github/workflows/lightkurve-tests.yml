@@ -1,17 +1,25 @@
 # GitHub Actions workflow for Lightkurve's continuous integration.
 #
-# This file configures seven different jobs:
-# 1) pytest on Linux, Python 3.7.
-# 2) pytest on Linux, Python 3.7.
-# 3) pytest on Linux, Python 3.8, with --remote-data enabled (i.e. get data from MAST).
-# 4) pytest on Linux, Python 3.9.
-# 5) pytest on Windows, Python 3.8.
-# 6) pytest on OSX, Python 3.8.
-# 7) flake8 syntax check.
+# This file configures nine different jobs:
+# 1) pytest on Linux, Python 3.9, with -m memtest (i.e. stress memory)
+# 2) pytest on Linux, Python 3.9, with --remote-data enabled (i.e. get data from MAST).
+# 3) pytest on Linux, Python 3.10.
+# 4) pytest on Linux, Python 3.11.
+# 5) pytest on Linux, Python 3.12.
+# 6) pytest on Linux, Python 3.13.
+# 7) pytest on Windows, Python 3.9.
+# 8) pytest on OSX, Python 3.9.
+# 9) flake8 syntax check.
 
 name: Lightkurve-tests
 
-on: [push, pull_request]
+on:
+  # We always want to run tests on main
+  push:
+    branches:
+      - main
+  # And we'll also run tests on pull requests
+  pull_request:
 
 jobs:
 
@@ -20,33 +28,37 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        name: [3.6, 3.7, 3.8-remote-data, 3.8-memtest, 3.9]
+        name: ["3.9-remote-data", "3.9-memtest", "3.10", "3.11", "3.12", "3.13"]
         include:
-          - name: 3.6
-            python-version: 3.6
-            pytest-command: poetry run pytest
-          - name: 3.7
-            python-version: 3.7
-            pytest-command: poetry run pytest
-          - name: 3.8-remote-data
-            python-version: 3.8
+          - name: "3.9-remote-data"
+            python-version: "3.9"
             pytest-command: poetry run pytest --remote-data --doctest-modules
-          - name: 3.8-memtest
-            python-version: 3.8
+          - name: "3.9-memtest"
+            python-version: "3.9"
             pytest-command: poetry run pytest -m memtest --remote-data
-          - name: 3.9
-            python-version: 3.9
+          - name: "3.10"
+            python-version: "3.10"
+            pytest-command: poetry run pytest
+          - name: "3.11"
+            python-version: "3.11"
+            pytest-command: poetry run pytest
+          - name: "3.12-remote-data"
+            python-version: "3.12"
+            pytest-command: poetry run pytest
+          - name: "3.13"
+            python-version: "3.13"
             pytest-command: poetry run pytest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v5
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip poetry
-        poetry install
+        python -m pip install --upgrade pip
+        python -m pip install poetry
+        poetry install --with dev
     - name: Test with ${{ matrix.pytest-command }}
       run: |
         ${{ matrix.pytest-command }}
@@ -56,18 +68,19 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        name: [3.8]
-        python-version: [3.8]
+        name: [3.9]
+        python-version: [3.9]
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v5
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip poetry
-        poetry install
+        python -m pip install --upgrade pip
+        python -m pip install poetry
+        poetry install --with dev
     - name: Test with pytest
       run: |
         poetry run pytest
@@ -77,17 +90,18 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        python-version: [3.8]
+        python-version: [3.9]
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v5
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip poetry
-        poetry install
+        python -m pip install --upgrade pip
+        python -m pip install poetry
+        poetry install --with dev
     - name: Test with pytest
       run: |
         poetry run pytest
@@ -97,17 +111,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.8]
+        python-version: [3.9]
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v5
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install flake8
       run: |
-        python -m pip install --upgrade pip poetry
-        poetry install
+        python -m pip install --upgrade pip
+        python -m pip install poetry
+        poetry install --with dev
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names

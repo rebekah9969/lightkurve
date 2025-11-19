@@ -451,6 +451,11 @@ def _create_image_array(header=None, shape=(5, 5)):
     return images
 
 
+# Ensure all internal file handles are closed
+#  (the ResourceWarning in case of unclosed file handles,
+#   is wrapped by PytestUnraisableExceptionWarning)
+@pytest.mark.filterwarnings("error::ResourceWarning")
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 def test_tpf_from_images():
     """Basic tests of tpf.from_fits_images()"""
     # Not without a wcs...
@@ -467,8 +472,10 @@ def test_tpf_from_images():
     w.wcs.cdelt = np.array([-0.066667, 0.066667])
     w.wcs.crval = [0, -90]
     w.wcs.ctype = ["RA---AIR", "DEC--AIR"]
+
     w.wcs.set_pv([(2, 1, 45.0)])
-    pixcrd = np.array([[0, 0], [24, 38], [45, 98]], np.float_)
+
+    pixcrd = np.asarray([[0, 0], [24, 38], [45, 98]], dtype=float)
     header = w.to_header()
     header["CRVAL1P"] = 10
     header["CRVAL2P"] = 20
@@ -498,36 +505,36 @@ def test_tpf_from_images():
             os.remove(tmp.name)
 
         # Can we read in a list of file names or a list of HDUlists?
-        hdus = []
-        tmpfile_names = []
-        for im in images:
-            tmpfile = tempfile.NamedTemporaryFile(delete=False)
-            tmpfile_names.append(tmpfile.name)
-            hdu = fits.HDUList([fits.PrimaryHDU(), im])
-            hdu.writeto(tmpfile.name)
-            hdus.append(hdu)
+        tmpfiles = []
+        try:
+            hdus = []
+            for im in images:
+                tmpfile = tempfile.NamedTemporaryFile(delete=False)
+                tmpfiles.append(tmpfile)
+                hdu = fits.HDUList([fits.PrimaryHDU(), im])
+                hdu.writeto(tmpfile.name)
+                hdus.append(hdu)
 
-        with warnings.catch_warnings():
-            # Ignore "LightkurveWarning: Could not detect filetype as TESSTargetPixelFile or KeplerTargetPixelFile, returning generic TargetPixelFile instead."
-            warnings.simplefilter("ignore", LightkurveWarning)
-            # Should be able to run with a list of file names
-            tpf_tmpfiles = TargetPixelFile.from_fits_images(
-                tmpfile_names,
-                size=(3, 3),
-                position=SkyCoord(ra, dec, unit=(u.deg, u.deg)),
-            )
 
-            # Should be able to run with a list of HDUlists
-            tpf_hdus = TargetPixelFile.from_fits_images(
-                hdus, size=(3, 3), position=SkyCoord(ra, dec, unit=(u.deg, u.deg))
-            )
+            with warnings.catch_warnings():
+                # Ignore "LightkurveWarning: Could not detect filetype as TESSTargetPixelFile or KeplerTargetPixelFile, returning generic TargetPixelFile instead."
+                warnings.simplefilter("ignore", LightkurveWarning)
+                # Should be able to run with a list of file names
+                tpf_tmpfiles = TargetPixelFile.from_fits_images(
+                    [t.name for t in tmpfiles],
+                    size=(3, 3),
+                    position=SkyCoord(ra, dec, unit=(u.deg, u.deg)),
+                )
 
-        # Clean up the temporary files we created
-        for filename in tmpfile_names:
-            try:
-                os.remove(filename)
-            except PermissionError:
-                pass  # This appears to happen on Windows
+                # Should be able to run with a list of HDUlists
+                tpf_hdus = TargetPixelFile.from_fits_images(
+                    hdus, size=(3, 3), position=SkyCoord(ra, dec, unit=(u.deg, u.deg))
+                )
+        finally:
+            # Clean up the temporary files we created
+            for tmpfile in tmpfiles:
+                tmpfile.close()
+                os.remove(tmpfile.name)
 
 
 def test_tpf_wcs_from_images():
@@ -605,11 +612,17 @@ def test_interact_sky():
 def test_get_models():
     """Can we obtain PRF and TPF models?"""
     tpf = KeplerTargetPixelFile(filename_tpf_all_zeros, quality_bitmask=None)
+
     with warnings.catch_warnings():
         # Ignore "RuntimeWarning: All-NaN slice encountered"
         warnings.simplefilter("ignore", RuntimeWarning)
-        tpf.get_model()
         tpf.get_prf_model()
+        # tpfmodels require oktopus
+        try:
+            from oktopus import Prior
+            tpf.get_model()
+        except ModuleNotFoundError:
+            pass
 
 
 @pytest.mark.remote_data
@@ -720,7 +733,7 @@ def test_cutout():
         assert ntpf.flux.shape[2] == 1
         ntpf = tpf.cutout(SkyCoord(tpf.ra, tpf.dec, unit="deg"), size=2)
         ntpf = tpf.cutout(size=2)
-        assert np.product(ntpf.flux.shape[1:]) == 4
+        assert np.prod(ntpf.flux.shape[1:]) == 4
         assert ntpf.targetid == tpf.targetid
 
 
@@ -803,7 +816,7 @@ def test_missing_pipeline_mask():
     TPFs produced by TESSCut contain an empty pipeline mask.  When the pipeline
     mask is missing or empty, we want `to_lightcurve()` to fall back on the
     'threshold' mask by default, to avoid creating a light curve based on zero pixels."""
-    tpf = search_tesscut("Proxima Cen", sector=12).download(cutout_size=1)
+    tpf = search_tesscut("Proxima Cen", sector=12).download(cutout_size=3)
     lc = tpf.to_lightcurve()
     assert np.isfinite(lc.flux).any()
     assert lc.meta.get("APERTURE_MASK", None) == "threshold"
@@ -876,3 +889,37 @@ def test_fluxmode():
 def test_animate():
     tpf = read(filename_tpf_one_center)
     tpf.animate()
+
+def test_parse_aperture_masks():
+    """Regression test for numpy 1.25.0"""
+    for tpf in [read(filename_tpf_tabby_lite), read(filename_tpf_one_center)]:
+        # Pipeline
+        # Check string apertures work as expected
+        for aperture in ["background", "threshold", "all", "empty", None]:
+            mask = tpf._parse_aperture_mask(aperture)
+            assert isinstance(mask, np.ndarray)
+            assert np.issubdtype(mask.dtype, bool)
+
+        # Check boolean apertures work as expected
+        for aperture in [np.zeros(tpf.shape[1:], bool), np.ones(tpf.shape[1:], bool), tpf.flux.value[0] > 0]:
+            mask = tpf._parse_aperture_mask(aperture)
+            assert isinstance(mask, np.ndarray)
+            assert np.issubdtype(mask.dtype, bool)
+
+        # Check integer masks work as expected:
+        for aperture in [np.ones(tpf.shape[1:]), np.zeros(tpf.shape[1:]), tpf.hdu[2].data, tpf.hdu[2].data.astype(int)]:
+            mask = tpf._parse_aperture_mask(aperture)
+            assert isinstance(mask, np.ndarray)
+            assert np.issubdtype(mask.dtype, bool)
+
+    # Check pipeline shows that no pixels are selected
+    tpf = read(filename_tpf_one_center)
+    with pytest.raises(ValueError) as exc:
+        tpf._parse_aperture_mask("pipeline")
+    assert "'pipeline' is requested, but it is missing or empty" in exc.value.args[0]
+
+    # Check pipeline shows that pixels are selected
+    tpf = read(filename_tpf_tabby_lite)
+    tpf._parse_aperture_mask("pipeline")
+    assert isinstance(mask, np.ndarray)
+    assert np.issubdtype(mask.dtype, bool)

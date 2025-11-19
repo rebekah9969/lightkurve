@@ -8,7 +8,7 @@ Using pip
 =========
 
 The easiest way to install *Lightkurve* and all of its dependencies is to use the ``pip`` command,
-which which is a standard part of all Python distributions.
+which is a standard part of all Python distributions.
 To install *Lightkurve*, run the following command in a terminal window::
 
     $ python -m pip install lightkurve --upgrade
@@ -39,27 +39,31 @@ To verify which version of *Lightkurve* you have installed, run::
 Requirements
 ============
 
-*Lightkurve* has the following minimum requirements:
+*Lightkurve* requires the following packages:
 
-- Python: 3.6 or later.
-- Astropy: 4.1 or later.
-- Numpy: 1.11 or later.
-- Scipy: 0.19 or later.
-- Matplotlib: 1.5.3 or later.
-- Astroquery: 0.3.10 or later.
-- Bokeh: 1.0 or later (for interactive widgets).
+- Astropy
+- Numpy
+- Scipy
+- Matplotlib
+- Astroquery
+- Bokeh (for interactive widgets).
 - Pandas.
 
 If you install *Lightkurve* using ``pip`` as explained above,
 these dependencies will be installed automatically if needed.
 
+Refer to ``[tool.poetry.dependencies]`` section of
+`pyproject.toml <../pyproject.toml>`_
+for the minimum versions of the packages required.
 
 
 Installing the development version
 ==================================
 
 If you want to experiment with the latest development version of
-*Lightkurve*, you can install it straight from the main branch on GitHub::
+*Lightkurve*, you can install it straight from the main branch on GitHub:
+
+.. code-block:: bash
 
     $ git clone https://github.com/lightkurve/lightkurve.git
     $ cd lightkurve
@@ -68,7 +72,10 @@ If you want to experiment with the latest development version of
 If you want to have a so-called editable install which enables the installed
 version to immediately reflect changes made in the source tree, you can use:
 
-    $ python shim-setup.py develop
+.. code-block:: bash
 
-Please see our guide on :ref:`contributing to lightkurve<contributing>`
+    $ python -m pip install poetry
+    $ poetry install
+
+Please see our guide on :ref:`Installing the development environment<install-dev-env>`
 for additional instructions.

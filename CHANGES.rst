@@ -1,16 +1,214 @@
-2.0.11 (unreleased)
+2.5.2dev  (unreleased)
+=====================
+- Patch for changes to astroquery 0.4.11. Search results using GAIA DR2 now case insensitive. Integer searches converted to string. [#1511]
+- Added Folded lightcurve reader to open data saved with ``lk.FoldedLightCurve.to_fits()`` [#1488]
+- Pass reader to ``read_generic_lightcurve()`` if Kepler/K2/TESS file type not recognized [#1488]
+- Fixes bug for reading in data with flux units listed as 'electron / s' [#1488] from issue [#1504]
+- Include MOM_CENTR1 and MOM_CENTR2, if it exists, when saving fits files [#1488]
+- Fixed bugs in ``bin`` for ``flux_err`` column. Improved ``bin`` performance. [#1499]
+- Updated search result sort order [#1384]
+
+2.5.1  (2025-05-20)
+=====================
+
+- Fixed pixel to world coordinate transformation in ``TargetPixelFile.get_coordinates()``
+  in line 488 ("ra, dec = w.wcs_pix2world(X.ravel(), Y.ravel(), 1)"), where for consistency with
+  Gaia the origin should be 0 instead of 1. [#1465]
+- Fixed ``LightCurve.select_flux()`` in edge cases, where the unit of
+  the new ``flux`` column is different from that of the ``flux_err`` column. [#1467]
+- Fixed numpy v2 compatibility for ``tpf.interact()``. [#1473]
+- Modified RegressionCorrector.correct() to add the model flux error in quadrature. [#1439]
+- Updated the default TESS quality mask to include Argabrightening, Impulsive Outlier, and Bad Calibration Exclude flags (see issue #1230). [#1336]
+- Updated tutorial notebook links [#1484]
+- Author keyword now specifies between SPOC and TESS-SPOC [#1487]
+- Changed calls of `np.in1d` to `np.isin` for numpy v2 compatibility [#1492]
+- Loosen dependency on oktopus (and autograd) to facilitate Numpy v2 support,
+  along with updates of some deprecated numpy calls.
+  They will still be pulled in with a default ``pip install``, but this allows
+  Lightkurve to be run without oktopus with only ``tpfmodel`` disabled [#1452]
+- Fixed the bug in ``bin()`` function with ``bin`` parameter for ``FoldedLightCurve`` objects. [#1491]
+- Modified ``copy()`` and ``bin()`` functions for ``FoldedLightCurve`` objects to fix issues with normalized phase [#1491]
+- Removed ``binsize`` and ``time_bin_end`` as input options for ``FoldedLightCurve`` objects [#1491]
+- Changed calls of ``np.in1d`` to ``np.isin`` for numpy v2 compatibility [#1492]
+
+2.5.0 (2024-08-29)
+=====================
+
+- Fixed memory leak in reading Lightcurve / TargetPixel FITS files in v2.4.2 [#1390]
+- Added support for changes in QLP High Level Science Product
+  in TESS sectors 56 and later. [#1392]
+- Added an informative error message when data products downloaded are
+  corrupted. [#1399]
+- Fixed to ensure file handles are properly released when reading
+  corrupted TargetPixelFile. [#1399]
+- Fixed ``FoldedLightCurve.cycle``, case ``epoch_time`` not specified [#1398]
+- Various improvements to the online documentation. [#1400, #1425]
+- Fixed a bug in ``tpf.interact()`` so that proper y label is displayed when
+  lightcurve is normalized with ``transform_func``. [#1387]
+- Changed 'short' cadence in search.py to be <200s so the new TESS FFI cadence is excluded [#1394]
+- Fixed ``lightkurve.utils.centroid_quadratic()`` in edge cases, e.g., fluxes are
+  all negative with mask specified, NaN in the identified brightest 3X3 patch. [#1426]
+- Fixed interact features, e.g. ``tpf.interact()``, to be compliant
+  with Bokeh v3.4.0. The minimum Bokeh version is raised to v2.3.2 accordingly. [#1428]
+- Updated aperture plotting to speed it up in the case of large (bleed column) apertures. [#1434]
+- Fixed time format for KEPSEISMIC light curves from bjkd to mjd. [#1443]
+- Fixed flux unit bug in to_fits [#1454]
+- Added support to read data products hosted on public AWS S3 buckets. [#1451]
+- Added functions to read in collections of light curves or target pixel files. [#1451]
+
+2.4.2 (2023-11-03)
+=====================
+
+- Fixed download issue due to MAST API change [#1380]
+
+2.4.1 (2023-09-06)
+=====================
+
+- Updated interact features to work with JupyterHub (e.g. TiKE) [#1349]
+- Exposed niters parameter in the PCA function of design matrix
+- Fixed the aperture parsing functions inside TPFs to be compliant with `numpy` v1.25 [#1360]
+- Made `LombScarglePeriodogram` compatible with Astropy v5.3 [#1342]
+- Updated the TPF plotting function to work correctly with WCS plotting [#1298]
+- Added the ability to open light curves from the TGLC High Level Science Product
+- Added in a flux_err mask to remove NaNs in pldcorrector
+
+2.4.0 (2023-02-14)
+==================
+
+- Added the ability to configure the default cache directory used by
+  ``SearchResult.download()`` / ``SearchResult.download_all()``. [#1214]
+
+- Moved the default cache directory from ``$HOME/.lightkurve-cache``
+  to ``$HOME/.lightkurve/cache``. [#1214]
+
+- Fixed interact features, e.g. ``tpf.interact()``, to work with bokeh v3.x [#1262]
+
+- Fixed ``SearchResult`` HTML display for links to TESS GI cycles 3/4 proposals. [#1260]
+
+- Fixed references to np.int and np.float due to changes in numpy v1.24. [#1279]
+
+
+2.3.0 (2022-07-07)
+==================
+
+- Added support for reading light curves created using the ``eleanor`` package
+  or provided by the GSFC-ELEANOR-LITE High Level Science Product. [#1217, #1236]
+
+- Added data product specific documentation. [#1233]
+
+- Added the ability to include more columns in ``SearchResult`` display via a new
+  ``SearchResult.display_extra_columns`` attribute, with defaults set by an
+  Astropy-based configuration system. [#1134, #1232]
+
+- Added a ``show_progress`` parameter to ``query_solar_system_objects()``,
+  which shows the download progress by default. [#1225]
+
+- Added the new TESS quality flag bits 13-15 to ``TessQualityFlags``. [#1218]
+
+- Added an informative error message when data products downloaded are
+  corrupted or download failed due to remote server error. [#1228]
+
+- Fixed an issue which caused unnecessary ``UnitsWarning`` being raised when
+  reading light curve files and CBV files with AstroPy v5.1 installed. [#1226, #1229]
+
+
+2.2.1 (2022-05-26)
+==================
+- Fixed a bug in ``LightCurve.flatten()`` which caused the flux unit of
+  flattened light curves to be non-dimensionless. [#1195]
+
+- Improved ``TargetPixelFile.interact_sky()`` to include TIC information
+  even when the TICs are not found in Gaia. [#1204]
+
+- Removed extraneous warnings from ``TargetPixelFile.interact_sky()``. [#1204]
+
+- Fixed a bug in ``FoldedLightCurve.odd_mask`` and ``.even_mask`` which caused
+  the mask to be incorrect when the phase is literal time. [#1105]
+
+- Added a new ``FoldedLightCurve.cycle`` attribute. [#1105]
+
+- Fixed a bug in ``LightCurve['time', '<some-column>']``, which triggered an
+  ``AttributeError`` when selecting a subset of columns including ``time``. [#1199]
+
+- Fixed a bug in ``LightCurve()`` constructor, which triggered an
+  ``AttributeError`` when `data` parameter is a ``list`` or ``ndarray`` [#1199]
+
+- Fixed a bug in ``LightCurve.query_solar_system_objects`` which caused an
+  excessive search radius to be used for TESS light curves. [#1208]
+
+- Various improvements to the online documentation. [#1197, #1210]
+
+
+
+2.2.0 (2022-04-12)
+==================
+
+- Fixed a bug in ``TargetPixelFile.interact()`` which prevented custom pixels
+  from being selected with Bokeh v2.3.x and later. [#1177]
+
+- Improved ``TargetPixelFile.interact_sky()`` by introducing an arrow to
+  highlight selected stars, adding an ``aperture_mask`` argument, and
+  defaulting to box zoom. [#1082]
+
+- Fixed a bug in ``LightCurve.select_flux()`` to ensure ``NORMALIZED`` header
+  is set based on the new ``flux`` column. [#1094]
+
+- Fixed a bug in ``LightCurveCollection.stitch()`` which triggered a ``ValueError``
+  when a mix of normal and masked columns was encountered. [#1182]
+
+- Removed the ``QColumn``, ``QMaskedColumn``, and ``QTimeSeries`` classes which were
+  temporarily added in Lightkurve v2.0 to support AstroPy v4.2 and earlier. [#1188]
+
+- Fixed a ``FutureWarning`` triggered by ``query_solar_system_objects()``. [#1189]
+
+- Removed ``setup.py`` because ``pip>=21.3`` now enables editable installs to
+  be executed using the ``pyproject.toml`` file instead. [#1185]
+
+
+
+2.1.1 (2022-03-24)
+==================
+
+- Fixed a bug in ``LightCurve.plot_river()`` which triggered a
+  `TypeError: cannot write to unmasked output`. [#1175]
+
+- Fixed a bug in `search_tesscut(...).download()` which caused TESSCut
+  downloads to fail when Astroquery v0.4.6 or later is installed. [#1176]
+
+- Fixed a bug in ``LightCurve.fill_gaps()`` which caused incorrect
+  results in the presence of masked data. [#1172]
+
+
+
+2.1.0 (2022-02-10)
+==================
+
+- Made Lightkurve compatible with AstroPy v5.0, which introduced masked quantities.
+  Lightkurve v2.1 now requires AstroPy v5.0 and Python v3.8 or later. [#1162]
+
+- Added the ``cbv_dir`` parameter to ``CBVCorrector``, ``load_kepler_cbvs``, and
+  ``load_tess_cbvs`` to enable CBVs to be loaded from a local directory. [#1122]
+
+- Deprecated ``download_kepler_cbvs`` and ``download_tess_cbvs`` in favor of
+  ``load_kepler_cbvs`` and ``load_tess_cbvs``. [#1122]
+
+- Restored original ``bins`` functionality from v1.x in ``LightCurve.bin()`` and
+  enabled iterable inputs to ``time_bin_start``, ``time_bin_end``, ``time_bin_size``
+  for custom bin sizes. [#1042]
+
+
+2.0.11 (2021-09-22)
 ===================
 
-- Fixed bugs in ``TargetPixelFile.interact_sky()`` when a `TargetPixelFile`
-  does not have the target's proper motion / coordinate; or it is from
-  `tpf.cutout()` call. [#1088]
+- Modified ``TargetPixelFile.interact_sky()`` to enable it to work with
+  pixel files which lack proper motion or coordinate information. [#1088]
 
 - Fixed excessive memory usage by ``LightCurve.bin()``. [#1096]
 
 - Various improvements to the online documentation. [#1102]
 
-- Fixed a bug in ``TargetPixelFile.estimate_centroids`` which caused the column
-  and row coordinates reported to be off by 0.5. [#1103]
+- Fixed a bug in ``TargetPixelFile.estimate_centroids()`` which caused the column
+  and row coordinates to be off by 0.5. [#1103]
 
 - Fixed a bug which caused a light curve's meta data to be lost after
   calling ``LightCurve.bin()``. [#1041]
@@ -19,8 +217,24 @@
   Dynamical Time (TDB) scale by default. [#1112]
 
 - Modified ``LightCurve.create_transit_mask()`` to accept AstroPy ``Quantity``
-  objects for the ``period`` and ``duration`` parameters. [#1119]
+  objects for ``period``, ``transit_time``, and ``duration``. [#1119, #1141]
 
+- Modified ``CBVCorrector`` to issue a warning message if the CBVs are
+  poorly aligned to the input light curve. [#1113]
+
+- Fixed a bug in ``underfit_metric_neighbors()`` which caused the alignment
+  of light curves to fail. [#1120]
+
+- Removed an unnecessary warning triggered when ``LightCurve.normalize()`` is called
+  on an already-normalized light curve. [#1128]
+
+- Fixed an AstroPy warning ("dropping mask in Quantity column") which was encountered
+  when opening a light curve with AstroPy v4.3 installed.
+
+- Fixed a bug in ``TargetPixelFile.animate()`` which caused a ``ModuleNotFoundError``
+  to be raised when using older versions of matplotlib. [#1139]
+
+- Added a ``column`` parameter to ``LightCurve.truncate()``. [#1116]
 
 
 2.0.10 (2021-06-04)
@@ -534,7 +748,7 @@ lightkurve.periodogram
   which deprecated the ``polyorder`` keyword in favor of ``degree``.
   [#613, #616, #617, #626]
 
-- Changed the `tutorials index page <https://docs.lightkurve.org/tutorials>`_
+- Changed the `tutorials index page <https://lightkurve.github.io/lightkurve/tutorials>`_
   in the online docs to make the tutorials easier to navigate.
 
 - Added a tutorial which demonstrates the use of Lightkurve's seismology module
@@ -592,7 +806,7 @@ lightkurve.periodogram
 - Added support for performing mathematical operations involving ``LightCurve``
   objects, e.g. two ``LightCurve`` objects can now be added together. [#532]
 
-- Updated the online tutorials (https://docs.lightkurve.org/tutorials) to
+- Updated the online tutorials (https://lightkurve.github.io/lightkurve/tutorials) to
   take all recent Lightkurve API changes into account. [#596]
 
 
@@ -794,7 +1008,7 @@ Bugfixes
 ===================
 
 - Introduced a new layout for the
-  `online documentation <https://docs.lightkurve.org>`_. [#360, #400, #406]
+  `online documentation <https://lightkurve.github.io/lightkurve/>`_. [#360, #400, #406]
 
 - Added ``LightCurve.interact_bls()``: an interactive Bokeh widget to find
   planets using the Box Least Squares (BLS) method. [#401]

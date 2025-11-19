@@ -17,6 +17,7 @@ from __future__ import division, print_function
 import os
 import logging
 import warnings
+import fnmatch
 
 import numpy as np
 from astropy.coordinates import SkyCoord, Angle
@@ -25,16 +26,19 @@ from astropy.stats import sigma_clip
 from astropy.time import Time
 import astropy.units as u
 from astropy.utils.exceptions import AstropyUserWarning
+import pandas as pd
 from pandas import Series
 
-from .utils import KeplerQualityFlags, LightkurveWarning, LightkurveError
+
+from .utils import KeplerQualityFlags, LightkurveWarning, LightkurveError, finalize_notebook_url
 
 log = logging.getLogger(__name__)
 
 # Import the optional Bokeh dependency, or print a friendly error otherwise.
+_BOKEH_IMPORT_ERROR = None
 try:
     import bokeh  # Import bokeh first so we get an ImportError we can catch
-    from bokeh.io import show, output_notebook, push_notebook
+    from bokeh.io import show, output_notebook
     from bokeh.plotting import figure, ColumnDataSource
     from bokeh.models import (
         LogColorMapper,
@@ -46,31 +50,38 @@ try:
         Range1d,
         LinearColorMapper,
         BasicTicker,
+        Arrow,
+        VeeHead,
     )
     from bokeh.layouts import layout, Spacer
     from bokeh.models.tools import HoverTool
     from bokeh.models.widgets import Button, Div
     from bokeh.models.formatters import PrintfTickFormatter
-except ImportError:
+except Exception as e:
     # We will print a nice error message in the `show_interact_widget` function
-    pass
+    # the error would be raised there in case users need to diagnose problems
+    _BOKEH_IMPORT_ERROR = e
 
 
 def _search_nearby_of_tess_target(tic_id):
     # To avoid warnings / overflow error in attempting to convert GAIA DR2, TIC ID, TOI
     # as int32 (the default) in some cases
+    # PR2152 found the table returned to have Gaia (lower case) rather than all caps. This is a workaround.
     return ascii.read(f"https://exofop.ipac.caltech.edu/tess/download_nearbytarget.php?id={tic_id}&output=csv",
                       format="csv",
                       fast_reader=False,
                       converters={
-                          "GAIA DR2": [ascii.convert_numpy(np.str)],
-                          "TIC ID": [ascii.convert_numpy(np.str)],
-                          "TOI": [ascii.convert_numpy(np.str)],
+                          "GAIA DR2": [ascii.convert_numpy(str)],
+                          "Gaia DR2": [ascii.convert_numpy(str)],
+                          "TIC ID": [ascii.convert_numpy(str)],
+                          "TOI": [ascii.convert_numpy(str)],
                           })
 
 
 def _get_tic_meta_of_gaia_in_nearby(tab, nearby_gaia_id, key, default=None):
-    res = tab[tab['GAIA DR2'] == str(nearby_gaia_id)]
+    gaia_col = fnmatch.filter(tab.colnames, "G[Aa][Ii][Aa] [Dd][Rr]2")[0]
+    
+    res = tab[tab[gaia_col] == str(nearby_gaia_id)]
     if len(res) > 0:
         return res[0][key]
     else:
@@ -135,8 +146,8 @@ def _get_corrected_coordinate(tpf_or_lc):
     ra_corrected, dec_corrected, pm_corrected = _correct_with_proper_motion(
             ra * u.deg, dec *u.deg,
             pm_ra * pm_unit, pm_dec * pm_unit,
-            # e.g., equinox 2000 is treated as J2000 is set to be noon of 2000-01-01 TT
-            Time(equinox, format="decimalyear", scale="tt") + 0.5,
+            # we assume the data is in J2000 epoch
+            Time('2000', format='byear'),
             new_time)
     return ra_corrected.to(u.deg).value,  dec_corrected.to(u.deg).value, pm_corrected
 
@@ -191,6 +202,22 @@ def prepare_lightcurve_datasource(lc):
     return lc_source
 
 
+def aperture_mask_to_selected_indices(aperture_mask):
+    """Convert the 2D aperture mask to 1D selection indices, for the use with bokeh ColumnDataSource."""
+    npix = aperture_mask.size
+    pixel_index_array = np.arange(0, npix, 1)
+    return pixel_index_array[aperture_mask.reshape(-1)]
+
+
+def aperture_mask_from_selected_indices(selected_pixel_indices, tpf):
+    """Convert an aperture mask in 1D selection indices back to 2D (in the shape of the given TPF)."""
+    npix = tpf.flux[0, :, :].size
+    pixel_index_array = np.arange(0, npix, 1).reshape(tpf.flux[0].shape)
+    selected_indices = np.array(selected_pixel_indices)
+    selected_mask_1d = np.isin(pixel_index_array, selected_indices)
+    return selected_mask_1d.reshape(tpf.flux[0].shape)
+
+
 def prepare_tpf_datasource(tpf, aperture_mask):
     """Prepare a bokeh DataSource object for selection glyphs
 
@@ -206,13 +233,19 @@ def prepare_tpf_datasource(tpf, aperture_mask):
     tpf_source : bokeh.plotting.ColumnDataSource
         Bokeh object to be shown.
     """
-    npix = tpf.flux[0, :, :].size
-    pixel_index_array = np.arange(0, npix, 1).reshape(tpf.flux[0].shape)
-    xx = tpf.column + np.arange(tpf.shape[2])
-    yy = tpf.row + np.arange(tpf.shape[1])
+    _, ny, nx = tpf.shape
+    # (xa, ya) pair enumerates all pixels of the tpf
+    xx = tpf.column + np.arange(nx)
+    yy = tpf.row + np.arange(ny)
     xa, ya = np.meshgrid(xx, yy)
+    # flatten them, as column data source requires 1d data
+    xa = xa.flatten()
+    ya = ya.flatten()
     tpf_source = ColumnDataSource(data=dict(xx=xa.astype(float), yy=ya.astype(float)))
-    tpf_source.selected.indices = pixel_index_array[aperture_mask].reshape(-1).tolist()
+    # convert the ndarray from aperture_mask_to_selected_indices() to plain list
+    # because bokeh v3.0.2 does not accept ndarray (and causes js error)
+    # see https://github.com/bokeh/bokeh/issues/12624
+    tpf_source.selected.indices = list(aperture_mask_to_selected_indices(aperture_mask))
     return tpf_source
 
 
@@ -265,14 +298,26 @@ def make_lightcurve_figure_elements(lc, lc_source, ylim_func=None):
 
     fig = figure(
         title=title,
-        plot_height=340,
-        plot_width=600,
+        height=340,
+        width=600,
         tools="pan,wheel_zoom,box_zoom,tap,reset",
         toolbar_location="below",
         border_fill_color="whitesmoke",
     )
     fig.title.offset = -10
-    fig.yaxis.axis_label = "Flux (e/s)"
+
+    # ylabel: mimic the logic in lc._create_plot()
+    ylabel = "Flux"
+    if lc.meta.get("NORMALIZED"):
+        ylabel = "Normalized " + ylabel
+    elif (lc["flux"].unit) and (lc["flux"].unit.to_string() != ""):
+        if lc["flux"].unit == (u.electron / u.second):
+            yunit_str = "e/s"  # the common case, use abbreviation
+        else:
+            yunit_str = lc["flux"].unit.to_string()
+        ylabel += f" ({yunit_str})"
+    fig.yaxis.axis_label = ylabel
+
     fig.xaxis.axis_label = "Time (days)"
     try:
         if (lc.mission == "K2") or (lc.mission == "Kepler"):
@@ -298,7 +343,7 @@ def make_lightcurve_figure_elements(lc, lc_source, ylim_func=None):
         nonselection_line_color="gray",
         nonselection_line_alpha=1.0,
     )
-    circ = fig.circle(
+    circ = fig.scatter(
         "time",
         "flux",
         source=lc_source,
@@ -345,23 +390,7 @@ def make_lightcurve_figure_elements(lc, lc_source, ylim_func=None):
     return fig, vertical_line
 
 
-def _add_nearby_tics_if_tess(tpf, source, tooltips):
-    tic_id = tpf.meta.get('TICID', None)
-    # handle 3 cases:
-    # - TESS tpf has a valid id, type integer
-    # - Some TESSCut has empty string while and some others has None
-    # - Kepler tpf does not have the header
-    if tic_id is None or tic_id == "":
-        return source, tooltips
-
-    if isinstance(tic_id, str):
-        # for cases tpf is from tpf.cutout() call in #1089
-        tic_id = tic_id.replace("_CUTOUT", "")
-
-    # nearby TICs from ExoFOP
-    tab = _search_nearby_of_tess_target(tic_id)
-
-    col_gaia_id = source.data['source']
+def _add_tics_with_matching_gaia_ids_to(result, tab, gaia_ids):
     # use pandas Series rather than plain list, so they look like the existing columns in the source
     #
     # Note: we convert all the data to string to better handles cases when a star has no TIC
@@ -369,28 +398,115 @@ def _add_nearby_tics_if_tess(tpf, source, tooltips):
     # bokeh's tooltip template will render it as NaN (rather than empty string)
     # To avoid NaN display, we force the Series to use string dtype, and for stars with missing TICs,
     # empty string will be used as the value. bokeh's tooltip template can correctly render it as empty string
-    gaia_ids = col_gaia_id.array
+
     col_tic_id = Series(data=[_get_tic_meta_of_gaia_in_nearby(tab, id, 'TIC ID', "") for id in gaia_ids],
-                        dtype=np.str)
+                        dtype=str)
     col_tess_mag = Series(data=[_get_tic_meta_of_gaia_in_nearby(tab, id, 'TESS Mag', "") for id in gaia_ids],
-                          dtype=np.str)
+                          dtype=str)
     col_separation = Series(data=[_get_tic_meta_of_gaia_in_nearby(tab, id, 'Separation (arcsec)', "") for id in gaia_ids],
-                            dtype=np.str)
+                            dtype=str)
 
-    source.data['tic'] = col_tic_id
-    source.data['TESSmag'] = col_tess_mag
-    source.data['separation'] = col_separation
+    result['tic'] = col_tic_id
+    result['TESSmag'] = col_tess_mag
+    result['separation'] = col_separation
+    return result
 
-    # issue: if tic / TESSmag of a star is None, the tooltip will show NaN as value, it might be too distracting
-    # A potential workaround is to set dtype of the pandas Series to panda native "Int64", "Float64" that treats
-    # the Series as None as N/A. But it does not work yet, as bokeh cannot handle such series, complaining
-    #  AttributeError: 'IntegerArray' object has no attribute 'tolist'
-    tooltips = [("TIC", "@tic"), ("TESS Mag", "@TESSmag"), ("Separation (\")", "@separation")] + tooltips
-    return source, tooltips
+# use case: signify Gaia ID (Source, int type) as missing
+_MISSING_INT_VAL = 0
+
+def _add_tics_with_no_matching_gaia_ids_to(result, tab, gaia_ids, magnitude_limit):
+    def _add_to(data_dict, dest_colname, src):
+        # the data_dict should ultimately have the same columns/dtype as the result,
+        # as it will be appended to the result at the end
+        data_dict[dest_colname] = Series(data=src, dtype=result[dest_colname].dtype)
+
+    def _dummy_like(ary, dtype):
+        dummy_val = None
+        if pd.api.types.is_integer_dtype(dtype):
+            dummy_val = _MISSING_INT_VAL
+        elif pd.api.types.is_float_dtype(dtype):
+            dummy_val = np.nan
+        return [dummy_val for i in range(len(ary))]
+
+    # filter out those with matching gaia ids
+    # (handled in `_add_tics_with_matching_gaia_ids_to()`)
+    gaia_str_ids = [str(id) for id in gaia_ids]
+    gaia_col = fnmatch.filter(tab.colnames, "G[Aa][Ii][Aa] [Dd][Rr]2")[0]
+    tab = tab[np.isin(tab[gaia_col], gaia_str_ids, invert=True)]
+
+    # filter out those with gaia ids, but Gaia Mag is smaller than magnitude_limit
+    # (they won't appear in the given gaia_ids list)
+    gaiamag_col = fnmatch.filter(tab.colnames, "G[Aa][Ii][Aa] [Mm][Aa][Gg]")[0]
+    tab = tab[tab[gaiamag_col] < magnitude_limit]
+
+    # apply magnitude_limit filter for those with no Gaia data using TESS mag
+    tab = tab[tab['TESS Mag'] < magnitude_limit]
+
+    # convert the filtered tab to a dataframe, so as to append to the existing result
+    data = dict()
+    _add_to(data, 'tic', tab['TIC ID'])
+    _add_to(data, 'TESSmag', tab['TESS Mag'])
+    _add_to(data, 'magForSize', tab['TESS Mag'])
+    _add_to(data, 'separation', tab['Separation (arcsec)'])
+    # convert the string Ra/Dec to float
+    # we assume the equinox is the same as those from Gaia DR2
+    coords = SkyCoord(tab['RA'], tab['Dec'], unit=(u.hourangle, u.deg), frame='icrs')
+    _add_to(data, 'RA_ICRS', coords.ra.value)
+    _add_to(data, 'DE_ICRS', coords.dec.value)
+    _add_to(data, 'pmRA', tab['PM RA (mas/yr)'])
+    _add_to(data, 'e_pmRA', tab['PM RA Err (mas/yr)'])
+    _add_to(data, 'pmDE', tab['PM Dec (mas/yr)'])
+    _add_to(data, 'e_pmDE', tab['PM Dec Err (mas/yr)'])
+
+    # add dummy columns so that the resulting data frame would match the existing one
+    nontic_colnames = [c for c in result.keys() if c not in data.keys()]
+    for c in nontic_colnames:
+        data[c] = Series(data=_dummy_like(tab, result[c].dtype), dtype=result[c].dtype)
+
+    # finally, append the entries to existing result dataframe
+    return pd.concat([result, pd.DataFrame(data)])
 
 
-def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
-    """Make the Gaia Figure Elements"""
+def _add_nearby_tics_if_tess(tpf, magnitude_limit, result):
+    tic_id = tpf.meta.get('TICID', None)
+    # handle 3 cases:
+    # - TESS tpf has a valid id, type integer
+    # - Some TESSCut has empty string while and some others has None
+    # - Kepler tpf does not have the header
+    if tic_id is None or tic_id == "":
+        return result, []
+
+    if isinstance(tic_id, str):
+        # for cases tpf is from tpf.cutout() call in #1089
+        tic_id = tic_id.replace("_CUTOUT", "")
+
+    # nearby TICs from ExoFOP
+    tab = _search_nearby_of_tess_target(tic_id)
+    gaia_ids = result['Source'].array
+
+    # merge the TICs with matching Gaia entries
+    result = _add_tics_with_matching_gaia_ids_to(result, tab, gaia_ids)
+
+    # add new entries for the TICs with no matching Gaia ones
+    result = _add_tics_with_no_matching_gaia_ids_to(result, tab, gaia_ids, magnitude_limit)
+
+    source_colnames_extras = ['tic', 'TESSmag', 'separation']
+    tooltips_extras = [("TIC", "@tic"), ("TESS Mag", "@TESSmag"), ("Separation (\")", "@separation")]
+    return result, source_colnames_extras, tooltips_extras
+
+
+def _to_display(series):
+    def _format(val):
+        if val == _MISSING_INT_VAL or np.isnan(val):
+            return ""
+        else:
+            return str(val)
+    return pd.Series(data=[_format(v) for v in series], dtype=str)
+
+
+def _get_nearby_gaia_objects(tpf, magnitude_limit=18):
+    """Get nearby objects (of the target defined in tpf) from Gaia.
+    The result is formatted for the use of plot."""
     # Get the positions of the Gaia sources
     try:
         c1 = SkyCoord(tpf.ra, tpf.dec, frame="icrs", unit="deg")
@@ -407,11 +523,16 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
     from astroquery.vizier import Vizier
 
     Vizier.ROW_LIMIT = -1
-    result = Vizier.query_region(
-        c1,
-        catalog=["I/345/gaia2"],
-        radius=Angle(np.max(tpf.shape[1:]) * pix_scale, "arcsec"),
-    )
+    with warnings.catch_warnings():
+        # suppress useless warning to workaround  https://github.com/astropy/astroquery/issues/2352
+        warnings.filterwarnings(
+            "ignore", category=u.UnitsWarning, message="Unit 'e' not supported by the VOUnit standard"
+        )
+        result = Vizier.query_region(
+            c1,
+            catalog=["I/345/gaia2"],
+            radius=Angle(np.max(tpf.shape[1:]) * pix_scale, "arcsec"),
+        )
     no_targets_found_message = ValueError(
         "Either no sources were found in the query region " "or Vizier is unavailable"
     )
@@ -426,6 +547,26 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
     result = result[result.Gmag < magnitude_limit]
     if len(result) == 0:
         raise no_targets_found_message
+    # drop all the filtered rows, it makes subsequent TESS-specific processing easier (to add rows/columns)
+    result.reset_index(drop=True, inplace=True)
+    result['magForSize'] = result['Gmag']  # to be used as the basis for sizing the dots in plots
+    return result
+
+
+def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
+    """Make the Gaia Figure Elements"""
+
+    result = _get_nearby_gaia_objects(tpf, magnitude_limit)
+
+    source_colnames_extras = []
+    tooltips_extras = []
+    try:
+        result, source_colnames_extras, tooltips_extras = _add_nearby_tics_if_tess(tpf, magnitude_limit, result)
+    except Exception as err:
+        warnings.warn(
+            f"interact_sky() - cannot obtain nearby TICs. Skip it. The error: {err}",
+            LightkurveWarning,
+        )
 
     ra_corrected, dec_corrected, _ = _correct_with_proper_motion(
             np.nan_to_num(np.asarray(result.RA_ICRS)) * u.deg, np.nan_to_num(np.asarray(result.DE_ICRS)) * u.deg,
@@ -435,13 +576,12 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
             tpf.time[0])
     result.RA_ICRS = ra_corrected.to(u.deg).value
     result.DE_ICRS = dec_corrected.to(u.deg).value
-
     # Convert to pixel coordinates
     radecs = np.vstack([result["RA_ICRS"], result["DE_ICRS"]]).T
     coords = tpf.wcs.all_world2pix(radecs, 0)
 
     # Gently size the points by their Gaia magnitude
-    sizes = 64.0 / 2 ** (result["Gmag"] / 5.0)
+    sizes = 64.0 / 2 ** (result["magForSize"] / 5.0)
     one_over_parallax = 1.0 / (result["Plx"] / 1000.0)
     source = ColumnDataSource(
         data=dict(
@@ -449,7 +589,7 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
             dec=result["DE_ICRS"],
             pmra=result["pmRA"],
             pmde=result["pmDE"],
-            source=result["Source"].astype(str),
+            source=_to_display(result["Source"]),
             Gmag=result["Gmag"],
             plx=result["Plx"],
             one_over_plx=one_over_parallax,
@@ -458,6 +598,8 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
             size=sizes,
         )
     )
+    for c in source_colnames_extras:
+        source.data[c] = result[c]
 
     tooltips = [
         ("Gaia source", "@source"),
@@ -470,16 +612,9 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
         ("column", "@x{0.0}"),
         ("row", "@y{0.0}"),
         ]
+    tooltips = tooltips_extras + tooltips
 
-    try:
-        source, tooltips = _add_nearby_tics_if_tess(tpf, source, tooltips)
-    except Exception as err:
-        warnings.warn(
-            f"interact_sky() - cannot obtain nearby TICs. Skip it. The error: {err}",
-            LightkurveWarning,
-        )
-
-    r = fig.circle(
+    r = fig.scatter(
         "x",
         "y",
         source=source,
@@ -487,9 +622,9 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
         size="size",
         line_color=None,
         selection_color="firebrick",
-        nonselection_fill_alpha=0.0,
+        nonselection_fill_alpha=0.3,
         nonselection_line_color=None,
-        nonselection_line_alpha=0.0,
+        nonselection_line_alpha=1.0,
         fill_color="firebrick",
         hover_fill_color="firebrick",
         hover_alpha=0.9,
@@ -507,14 +642,77 @@ def add_gaia_figure_elements(tpf, fig, magnitude_limit=18):
 
     # mark the target's position too
     target_ra, target_dec, pm_corrected = _get_corrected_coordinate(tpf)
+    target_x, target_y = None, None
     if target_ra is not None and target_dec is not None:
-        target_x, target_y = tpf.wcs.all_world2pix([(target_ra, target_dec)], 0)[0]
-        fig.cross(x=tpf.column + target_x, y=tpf.row + target_y, size=20, color="black", line_width=1)
+        pix_x, pix_y = tpf.wcs.all_world2pix([(target_ra, target_dec)], 0)[0]
+        target_x, target_y = tpf.column + pix_x, tpf.row + pix_y
+        fig.scatter(marker="cross", x=target_x, y=target_y, size=20, color="black", line_width=1)
         if not pm_corrected:
             warnings.warn(("Proper motion correction cannot be applied to the target, as none is available. "
                            "Thus the target (the cross) might be noticeably away from its actual position, "
                            "if it has large proper motion."),
                            category=LightkurveWarning)
+
+    # display an arrow on the selected target
+    arrow_head = VeeHead(size=16)
+    arrow_4_selected = Arrow(end=arrow_head, line_color="red", line_width=4,
+                             x_start=0, y_start=0, x_end=0, y_end=0, tags=["selected"],
+                             visible=False)
+    fig.add_layout(arrow_4_selected)
+
+    def show_arrow_at_target(attr, old, new):
+        if len(new) > 0:
+            x, y = source.data["x"][new[0]], source.data["y"][new[0]]
+
+            # workaround: the arrow_head color should have been specified once
+            # in its creation, but it seems to hit a bokeh bug, resulting in an error
+            # of the form  ValueError("expected ..., got {'value': 'red'}")
+            # in actual websocket call, it seems that the color value is
+            # sent as "{'value': 'red'}", but they are expdecting "red" instead.
+            # somehow the error is bypassed if I specify it later in here.
+            #
+            # The issue is present in bokeh 2.2.3 / 2.1.1, but  not in bokeh 2.3.1
+            # I cannot identify a specific issue /PR on github about it though.
+            arrow_head.fill_color = "red"
+            arrow_head.line_color = "black"
+
+            # place the arrow near (x,y), taking care of boundary cases (at the edge of the plot)
+            if x < fig.x_range.start + 1:
+                # boundary case: the point is at the left edge of the plot
+                arrow_4_selected.x_start = x + 0.85
+                arrow_4_selected.x_end = x + 0.2
+            elif x > fig.x_range.end - 1:
+                # boundary case: the point is at the right edge of the plot
+                arrow_4_selected.x_start = x - 0.85
+                arrow_4_selected.x_end = x - 0.2
+            elif target_x is None or x < target_x:
+                # normal case 1 : point is to the left of the target
+                arrow_4_selected.x_start = x - 0.85
+                arrow_4_selected.x_end = x - 0.2
+            else:
+                # normal case 2 : point is to the right of the target
+                # flip arrow's direction so that it won't overlap with the target
+                arrow_4_selected.x_start = x + 0.85
+                arrow_4_selected.x_end = x + 0.2
+
+            if y > fig.y_range.end - 0.5:
+                # boundary case: the point is at near the top of the plot
+                arrow_4_selected.y_start = y - 0.4
+                arrow_4_selected.y_end = y - 0.1
+            elif y < fig.y_range.start + 0.5:
+                # boundary case: the point is at near the top of the plot
+                arrow_4_selected.y_start = y + 0.4
+                arrow_4_selected.y_end = y + 0.1
+            else:  # normal case
+                arrow_4_selected.y_start = y
+                arrow_4_selected.y_end = y
+
+            arrow_4_selected.visible = True
+        else:
+            arrow_4_selected.visible = False
+
+    source.selected.on_change("indices", show_arrow_at_target)
+
 
     # a widget that displays some of the selected star's metadata
     # so that they can be copied (e.g., GAIA ID).
@@ -568,18 +766,33 @@ SIMBAD by coordinate</a></td></tr>
             message_selected_target.text = msg
         # else do nothing (not clearing the widget) for now.
 
+    def on_selected_change(*args):
+        show_arrow_at_target(*args)
+        show_target_info(*args)
+
     source.selected.on_change("indices", show_target_info)
 
     return fig, r, message_selected_target
 
 
+def to_selected_pixels_source(tpf_source):
+    xx = tpf_source.data["xx"].flatten()
+    yy = tpf_source.data["yy"].flatten()
+    selected_indices = tpf_source.selected.indices
+    return ColumnDataSource(dict(
+        xx=xx[selected_indices],
+        yy=yy[selected_indices],
+    ))
+
+
 def make_tpf_figure_elements(
     tpf,
     tpf_source,
+    tpf_source_selectable=True,
     pedestal=None,
     fiducial_frame=None,
-    plot_width=370,
-    plot_height=340,
+    width=370,
+    height=340,
     scale="log",
     vmin=None,
     vmax=None,
@@ -594,6 +807,9 @@ def make_tpf_figure_elements(
         TPF to show.
     tpf_source : bokeh.plotting.ColumnDataSource
         TPF data source.
+    tpf_source_selectable : boolean
+        True if the tpf_source is selectable. False to show the selected pixels
+        in the tpf_source only. Default is True.
     pedestal: float
         A scalar value to be added to the TPF flux values, often to avoid
         taking the log of a negative number in colorbars.
@@ -630,8 +846,8 @@ def make_tpf_figure_elements(
     # We subtract 0.5 from the range below because pixel coordinates refer to
     # the middle of a pixel, e.g. (col, row) = (10.0, 20.0) is a pixel center.
     fig = figure(
-        plot_width=plot_width,
-        plot_height=plot_height,
+        width=width,
+        height=height,
         x_range=(tpf.column - 0.5, tpf.column + tpf.shape[2] - 0.5),
         y_range=(tpf.row - 0.5, tpf.row + tpf.shape[1] - 0.5),
         title=title,
@@ -700,16 +916,33 @@ def make_tpf_figure_elements(
     color_bar.formatter = PrintfTickFormatter(format="%14i")
 
     if tpf_source is not None:
-        fig.rect(
-            "xx",
-            "yy",
-            1,
-            1,
-            source=tpf_source,
-            fill_color="gray",
-            fill_alpha=0.4,
-            line_color="white",
-        )
+        if tpf_source_selectable:
+            fig.rect(
+                "xx",
+                "yy",
+                1,
+                1,
+                source=tpf_source,
+                fill_color="gray",
+                fill_alpha=0.4,
+                line_color="white",
+                )
+        else:
+            # Paint the selected pixels such that they cannot be selected / deselected.
+            # Used to show specified aperture pixels without letting users to
+            # change them in ``interact_sky```
+            selected_pixels_source = to_selected_pixels_source(tpf_source)
+            r_selected = fig.rect(
+                "xx",
+                "yy",
+                1,
+                1,
+                source=selected_pixels_source,
+                fill_color="gray",
+                fill_alpha=0.0,
+                line_color="white",
+                )
+            r_selected.nonselection_glyph = None
 
     # Configure the stretch slider and its callback function
     if scale == "log":
@@ -765,7 +998,7 @@ def make_default_export_name(tpf, suffix="custom-lc"):
 
 def show_interact_widget(
     tpf,
-    notebook_url="localhost:8888",
+    notebook_url=None,
     lc=None,
     max_cadences=200000,
     aperture_mask="default",
@@ -800,6 +1033,9 @@ def show_interact_widget(
         will need to supply this value for the application to display
         properly. If no protocol is supplied in the URL, e.g. if it is
         of the form "localhost:8888", then "http" will be used.
+        For use with JupyterHub, set the environment variable LK_JUPYTERHUB_EXTERNAL_URL
+        to the public hostname of your JupyterHub and notebook_url will
+        be defined appropriately automatically.
     max_cadences: int
         Raise a RuntimeError if the number of cadences shown is larger than
         this value. This limit helps keep browsers from becoming unresponsive.
@@ -838,19 +1074,14 @@ def show_interact_widget(
     cmap: str
         Colormap to use for tpf plot. Default is 'Viridis256'
     """
-    try:
-        import bokeh
-
-        if bokeh.__version__[0] == "0":
-            warnings.warn(
-                "interact() requires Bokeh version 1.0 or later", LightkurveWarning
-            )
-    except ImportError:
+    if _BOKEH_IMPORT_ERROR is not None:
         log.error(
             "The interact() tool requires the `bokeh` Python package; "
             "you can install bokeh using e.g. `conda install bokeh`."
         )
-        return None
+        raise _BOKEH_IMPORT_ERROR
+
+    notebook_url = finalize_notebook_url(notebook_url)
 
     aperture_mask = tpf._parse_aperture_mask(aperture_mask)
     if ~aperture_mask.any():
@@ -885,9 +1116,6 @@ def show_interact_widget(
 
     if transform_func is not None:
         lc = transform_func(lc)
-
-    npix = tpf.flux[0, :, :].size
-    pixel_index_array = np.arange(0, npix, 1).reshape(tpf.flux[0].shape)
 
     # Bokeh cannot handle many data points
     # https://github.com/bokeh/bokeh/issues/7490
@@ -958,8 +1186,7 @@ def show_interact_widget(
             tpf, selected_pixel_indices, transform_func=transform_func
         ):
             """Create the lightcurve from the selected pixel index list"""
-            selected_indices = np.array(selected_pixel_indices)
-            selected_mask = np.isin(pixel_index_array, selected_indices)
+            selected_mask = aperture_mask_from_selected_indices(selected_pixel_indices, tpf)
             lc_new = tpf.to_lightcurve(aperture_mask=selected_mask)
             lc_new.meta["APERTURE_MASK"] = selected_mask
             if transform_func is not None:
@@ -1013,7 +1240,7 @@ def show_interact_widget(
                 vertical_line.update(location=tpf.time.value[frameno])
             else:
                 fig_tpf.select("tpfimg")[0].data_source.data["image"] = [
-                    tpf.flux.value[0, :, :] * np.NaN
+                    tpf.flux.value[0, :, :] * np.nan
                 ]
             lc_source.selected.indices = []
 
@@ -1039,7 +1266,7 @@ def show_interact_widget(
                     exported_filename,
                     overwrite=True,
                     flux_column_name="SAP_FLUX",
-                    aperture_mask=lc_new.meta["APERTURE_MASK"].astype(np.int),
+                    aperture_mask=lc_new.meta["APERTURE_MASK"].astype(np.int_),
                     SOURCE="lightkurve interact",
                     NOTE="custom mask",
                     MASKNPIX=np.nansum(lc_new.meta["APERTURE_MASK"]),
@@ -1088,7 +1315,8 @@ def show_interact_widget(
     return show(create_interact_ui, notebook_url=notebook_url)
 
 
-def show_skyview_widget(tpf, notebook_url="localhost:8888", magnitude_limit=18):
+
+def show_skyview_widget(tpf, notebook_url=None, aperture_mask="empty",  magnitude_limit=18):
     """skyview
 
     Parameters
@@ -1104,22 +1332,23 @@ def show_skyview_widget(tpf, notebook_url="localhost:8888", magnitude_limit=18):
         will need to supply this value for the application to display
         properly. If no protocol is supplied in the URL, e.g. if it is
         of the form "localhost:8888", then "http" will be used.
+        For use with JupyterHub, set the environment variable LK_JUPYTERHUB_EXTERNAL_URL
+        to the public hostname of your JupyterHub and notebook_url will
+        be defined appropriately automatically.
+    aperture_mask : array-like, 'pipeline', 'threshold', 'default', 'background', or 'empty'
+        Highlight pixels selected by aperture_mask.
+        Default is 'empty': no pixel is highlighted.
     magnitude_limit : float
         A value to limit the results in based on Gaia Gmag. Default, 18.
     """
-    try:
-        import bokeh
-
-        if bokeh.__version__[0] == "0":
-            warnings.warn(
-                "interact_sky() requires Bokeh version 1.0 or later", LightkurveWarning
-            )
-    except ImportError:
+    if _BOKEH_IMPORT_ERROR is not None:
         log.error(
             "The interact_sky() tool requires the `bokeh` Python package; "
             "you can install bokeh using e.g. `conda install bokeh`."
         )
-        return None
+        raise _BOKEH_IMPORT_ERROR
+
+    notebook_url = finalize_notebook_url(notebook_url)
 
     # Try to identify the "fiducial frame", for which the TPF WCS is exact
     zp = (tpf.pos_corr1 == 0) & (tpf.pos_corr2 == 0)
@@ -1130,17 +1359,21 @@ def show_skyview_widget(tpf, notebook_url="localhost:8888", magnitude_limit=18):
     else:
         fiducial_frame = 0
 
+    aperture_mask = tpf._parse_aperture_mask(aperture_mask)
     def create_interact_ui(doc):
+        tpf_source = prepare_tpf_datasource(tpf, aperture_mask)
+
         # The data source includes metadata for hover-over tooltips
-        tpf_source = None
 
         # Create the TPF figure and its stretch slider
         fig_tpf, stretch_slider = make_tpf_figure_elements(
             tpf,
             tpf_source,
+            tpf_source_selectable=False,
             fiducial_frame=fiducial_frame,
-            plot_width=640,
-            plot_height=600,
+            width=640,
+            height=600,
+            tools="tap,box_zoom,wheel_zoom,reset"
         )
         fig_tpf, r, message_selected_target = add_gaia_figure_elements(
             tpf, fig_tpf, magnitude_limit=magnitude_limit

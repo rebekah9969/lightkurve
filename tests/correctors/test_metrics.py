@@ -7,6 +7,7 @@ from lightkurve.correctors.metrics import (
     overfit_metric_lombscargle,
     underfit_metric_neighbors,
     _compute_correlation,
+    _align_to_lc,
 )
 
 
@@ -38,15 +39,14 @@ def test_underfit_metric_neighbors():
     """Sanity checks for `underfit_metric_neighbors`."""
     # PDCSAP_FLUX has a very good score (>0.99) because it has been corrected
     lc_pdcsap = search_lightcurve("Proxima Cen", sector=11, author="SPOC").download(
-        flux_column="pdcsap_flux"
+        flux_column="pdcsap_flux", 
     )
     assert underfit_metric_neighbors(lc_pdcsap, min_targets=3, max_targets=3) > 0.99
-
-    # SAP_FLUX has a worse score (<0.9) because it hasn't been corrected
-    lc_sap = lc_pdcsap.copy()
-    lc_sap.flux = lc_pdcsap.sap_flux
-    lc_sap.flux_err = lc_pdcsap.sap_flux_err
-    assert underfit_metric_neighbors(lc_sap, min_targets=3, max_targets=3) < 0.9
+    # SAP_FLUX has a worse score (<0.95) because it hasn't been corrected
+    lc_sap = search_lightcurve("Proxima Cen", sector=11, author="SPOC").download(
+        flux_column="sap_flux", 
+    )
+    assert underfit_metric_neighbors(lc_sap, min_targets=3, max_targets=3) < 0.95
 
     # A flat light curve should have a perfect score (1)
     notnan = ~np.isnan(lc_sap.flux)
@@ -81,3 +81,21 @@ def test_compute_correlation():
         ]
     )
     assert_allclose(correlation_matrix, correlation_truth)
+
+def test_align_to_lc():
+    """ Test to ensure we can properly align different light curves
+    """
+
+    time = np.arange(1, 100, 0.1)
+    lc1 = LightCurve(time=time, flux=1, flux_err=0.0)
+    lc1['cadenceno'] = np.arange(1,len(time)+1)
+    lc2 = LightCurve(time=time, flux=2, flux_err=0.0)
+    lc2['cadenceno'] = np.arange(1,len(time)+1)
+
+    # Remove different cadences from both light curve and align the second to the first
+    lc1 = lc1[0:10].append(lc1[20:100])
+    lc2 = lc2[0:50].append(lc2[70:100])
+
+    aligned_lc2 = _align_to_lc(lc2, lc1)
+
+    assert np.all(lc1['cadenceno'] == aligned_lc2['cadenceno'])

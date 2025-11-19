@@ -9,7 +9,6 @@ from astropy.table import vstack
 from astropy.utils.decorators import deprecated
 
 from . import MPLSTYLE
-from .targetpixelfile import TargetPixelFile
 from .utils import LightkurveWarning, LightkurveDeprecationWarning
 
 
@@ -203,6 +202,7 @@ class LightCurveCollection(Collection):
                 if col in lc.columns:
                     if not (
                         issubclass(lcs[0][col].__class__, lc[col].__class__)
+                        or issubclass(lc[col].__class__, lcs[0][col].__class__)
                         or lcs[0][col].__class__.info is lc[col].__class__.info
                     ):
                         columns_to_remove.add(col)

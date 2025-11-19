@@ -77,6 +77,12 @@ language = None
 # This patterns also effect to html_static_path and html_extra_path
 exclude_patterns = ["**/.ipynb_checkpoints"]
 
+if os.environ.get('LK_DOC_BUILD_EXCLUDE_IPYNB', None) is not None:
+    # Skip building ipynb (in tutorials) to speed up doc build
+    # for testing changes in other sections: API reference, etc.
+    exclude_patterns.append("**.ipynb")
+    print("Note: .ipynb build is excluded")
+
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
 
@@ -87,7 +93,7 @@ todo_include_todos = True
 nbsphinx_execute = "auto"
 
 # Some notebook cells take longer than 60 seconds to execute
-nbsphinx_timeout = 300
+nbsphinx_timeout = 500
 
 # PUT PROLOG HERE
 nbsphinx_prolog = r"""
@@ -98,9 +104,8 @@ nbsphinx_prolog = r"""
     .. raw:: html
 
         <div style="float:right; margin-bottom:1em;">
-            <a href="https://github.com/lightkurve/lightkurve/raw/main/docs/source/{{ docname }}"><img src="https://img.shields.io/badge/Jupyter%20Notebook-Download-blue.svg"></a>
-            <a href=" https://colab.research.google.com/github/lightkurve/lightkurve/blob/main/docs/source/{{ docname }}"><img src="https://colab.research.google.com/assets/colab-badge.svg"></a>
-            <a href="https://mybinder.org/v2/gh/lightkurve/lightkurve/main?filepath=docs/source/{{ docname }}"><img alt="Binder badge" src="https://mybinder.org/badge_logo.svg"></a>
+            <a href="https://github.com/lightkurve/lightkurve/raw/main/docs/source/{{ docname }}"><img src="https://img.shields.io/badge/Notebook-Download-130654?logo=Jupyter&labelColor=fafafa"></a>
+            <a href="https://timeseries.science.stsci.edu/hub/user-redirect/git-pull?repo=https%3A%2F%2Fgithub.com%2Flightkurve%2Flightkurve&urlpath=lab%2Ftree%2Flightkurve%2Fdocs%2Fsource%2F{{ docname }}&branch=main"><img src="https://img.shields.io/badge/Notebook-Open%20in%20TIKE-130654?logo=Jupyter&labelColor=fafafa"></a>
         </div>
         <br style="clear:both;">
 """
@@ -113,8 +118,8 @@ html_theme_options = {
     "external_links": [],
     "github_url": "https://github.com/lightkurve/lightkurve",
     "google_analytics_id": "UA-69171-9",
-    "search_bar_position": "navbar",
 }
+
 
 html_title = "Lightkurve "
 
@@ -127,7 +132,7 @@ html_css_files = [
 html_sidebars = {
   "tutorials/*": [],
   "tutorials/*/*": [],
-  "tutorials/*/*/*": []
+  "tutorials/*/*/*": [],
 }
 
 # Raw files we want to copy using the sphinxcontrib-rawfiles extension:
@@ -144,4 +149,4 @@ intersphinx_mapping = {'python': ('https://docs.python.org/3/', None),
                        'scipy': ('https://docs.scipy.org/doc/scipy/reference', None),
                        'matplotlib': ('https://matplotlib.org', None),
                        'pandas': ('https://pandas.pydata.org/pandas-docs/stable/', None),
-                       'astropy': ('https://docs.astropy.org/en/latest/', None)}
+                       'astropy': ('https://docs.astropy.org/en/stable/', None)}

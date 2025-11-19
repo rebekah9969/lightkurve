@@ -6,9 +6,9 @@ from .generic import read_generic_lightcurve
 
 
 def read_tess_lightcurve(
-    filename, flux_column="pdcsap_flux", quality_bitmask="default"
+    filename, flux_column="pdcsap_flux", quality_bitmask="default", time_format="btjd",
 ):
-    """Returns a `TessLightCurve`.
+    """Returns a TESS `~lightkurve.lightcurve.LightCurve`.
 
     Parameters
     ----------
@@ -21,17 +21,16 @@ def read_tess_lightcurve(
         be used to mask out bad cadences. If a string is passed, it has the
         following meaning:
 
-            * "none": no cadences will be ignored (`quality_bitmask=0`).
-            * "default": cadences with severe quality issues will be ignored
-              (`quality_bitmask=1130799`).
-            * "hard": more conservative choice of flags to ignore
-              (`quality_bitmask=1664431`). This is known to remove good data.
-            * "hardest": removes all data that has been flagged
-              (`quality_bitmask=2096639`). This mask is not recommended.
+            * "none": no cadences will be ignored.
+            * "default": cadences with severe quality issues will be ignored.
+            * "hard": more conservative choice of flags to ignore.
+              This is known to remove good data.
+            * "hardest": removes all data that has been flagged.
+              This mask is not recommended.
 
-        See the :class:`TessQualityFlags` class for details on the bitmasks.
+        See the `~lightkurve.utils.TessQualityFlags` class for details on the bitmasks.
     """
-    lc = read_generic_lightcurve(filename, flux_column=flux_column, time_format="btjd")
+    lc = read_generic_lightcurve(filename, flux_column=flux_column, time_format=time_format)
 
     # Filter out poor-quality data
     # NOTE: Unfortunately Astropy Table masking does not yet work for columns
@@ -42,7 +41,10 @@ def read_tess_lightcurve(
     )
     lc = lc[quality_mask]
 
-    lc.meta["AUTHOR"] = "SPOC"
+    if 'tess-spoc' in filename:
+        lc.meta["AUTHOR"] = "TESS-SPOC"
+    else:
+        lc.meta["AUTHOR"] = "SPOC"
     lc.meta["TARGETID"] = lc.meta.get("TICID")
     lc.meta["QUALITY_BITMASK"] = quality_bitmask
     lc.meta["QUALITY_MASK"] = quality_mask

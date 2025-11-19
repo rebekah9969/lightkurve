@@ -22,6 +22,7 @@ from astropy.units import Quantity
 import astropy.units as u
 
 import matplotlib
+from matplotlib import animation
 from matplotlib import patches
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -42,6 +43,7 @@ from .utils import (
     validate_method,
     centroid_quadratic,
     _query_solar_system_objects,
+    finalize_notebook_url,
 )
 from .io import detect_filetype
 
@@ -100,13 +102,23 @@ class TargetPixelFile(object):
         self.path = path
         if isinstance(path, fits.HDUList):
             self.hdu = path
+        elif isinstance(path, str) and path.startswith("s3://"):
+            # Filename is an S3 cloud URI
+            self.hdu = fits.open(
+                path, use_fsspec=True, fsspec_kwargs={"anon": True}, **kwargs
+            )
         else:
             self.hdu = fits.open(self.path, **kwargs)
-        self.quality_bitmask = quality_bitmask
-        self.targetid = targetid
+        try:
+            self.quality_bitmask = quality_bitmask
+            self.targetid = targetid
 
-        # For consistency with `LightCurve`, provide a `meta` dictionary
-        self.meta = HduToMetaMapping(self.hdu[0])
+            # For consistency with `LightCurve`, provide a `meta` dictionary
+            self.meta = HduToMetaMapping(self.hdu[0])
+        except Exception as e:
+            # Cannot instantiate TargetPixelFile, close the HDU to release the file handle
+            self.hdu.close()
+            raise e
 
     def __getitem__(self, key):
         """Implements indexing and slicing.
@@ -475,7 +487,7 @@ class TargetPixelFile(object):
         ).transpose([1, 2, 0])
 
         # Pass through WCS
-        ra, dec = w.wcs_pix2world(X.ravel(), Y.ravel(), 1)
+        ra, dec = w.wcs_pix2world(X.ravel(), Y.ravel(), 0)
         ra = ra.reshape((pos_corr1_pix.shape[0], self.shape[1], self.shape[2]))
         dec = dec.reshape((pos_corr2_pix.shape[0], self.shape[1], self.shape[2]))
         ra, dec = ra[self.quality_mask], dec[self.quality_mask]
@@ -565,7 +577,9 @@ class TargetPixelFile(object):
         lc : LightCurve object
             Object containing the resulting lightcurve.
         """
-        method = validate_method(method, supported_methods=["aperture", "prf", "sap", "sff", "cbv", "pld"])
+        method = validate_method(
+            method, supported_methods=["aperture", "prf", "sap", "sff", "cbv", "pld"]
+        )
         if method in ["aperture", "sap"]:
             return self.extract_aperture_photometry(**kwargs)
         elif method == "prf":
@@ -577,9 +591,12 @@ class TargetPixelFile(object):
             return self.to_corrector("pld", **kwargs).correct()
 
     def _resolve_default_aperture_mask(self, aperture_mask):
-        if isinstance(aperture_mask, str) and (aperture_mask == "default"):
-            # returns 'pipeline', unless it is missing. Falls back to 'threshold'
-            return "pipeline" if np.any(self.pipeline_mask) else "threshold"
+        if isinstance(aperture_mask, str):
+            if aperture_mask == "default":
+                # returns 'pipeline', unless it is missing. Falls back to 'threshold'
+                return "pipeline" if np.any(self.pipeline_mask) else "threshold"
+            else:
+                return aperture_mask
         else:
             return aperture_mask
 
@@ -614,48 +631,48 @@ class TargetPixelFile(object):
         aperture_mask = self._resolve_default_aperture_mask(aperture_mask)
 
         # If 'pipeline' mask is requested but missing, fall back to 'threshold'
-        if (
-            isinstance(aperture_mask, str)
-            and (aperture_mask == "pipeline")
-            and ~np.any(self.pipeline_mask)
-        ):
-            raise ValueError(
-                "_parse_aperture_mask: 'pipeline' is requested, but it is missing or empty."
-            )
+        # To Do: Should pipeline mask always be True?
+        if isinstance(aperture_mask, str):
+            if (aperture_mask == "pipeline") and ~np.any(self.pipeline_mask):
+                raise ValueError(
+                    "_parse_aperture_mask: 'pipeline' is requested, but it is missing or empty."
+                )
 
         # Input validation
-        if hasattr(aperture_mask, "shape") and (
-            aperture_mask.shape != self.flux[0].shape
-        ):
-            raise ValueError(
-                "`aperture_mask` has shape {}, "
-                "but the flux data has shape {}"
-                "".format(aperture_mask.shape, self.flux[0].shape)
-            )
+        if hasattr(aperture_mask, "shape"):
+            if aperture_mask.shape != self.shape[1:]:
+                raise ValueError(
+                    "`aperture_mask` has shape {}, "
+                    "but the flux data has shape {}"
+                    "".format(aperture_mask.shape, self.shape[1:])
+                )
 
-        with warnings.catch_warnings():
-            # `aperture_mask` supports both arrays and string values; these yield
-            # uninteresting FutureWarnings when compared, so let's ignore that.
-            warnings.simplefilter(action="ignore", category=FutureWarning)
-            if aperture_mask is None or aperture_mask == "all":
+        if aperture_mask is None:
+            aperture_mask = np.ones((self.shape[1], self.shape[2]), dtype=bool)
+        elif isinstance(aperture_mask, str):
+            if aperture_mask.lower() == "all":
                 aperture_mask = np.ones((self.shape[1], self.shape[2]), dtype=bool)
-            elif aperture_mask == "pipeline":
+            elif aperture_mask.lower() == "pipeline":
                 aperture_mask = self.pipeline_mask
-            elif aperture_mask == "threshold":
+            elif aperture_mask.lower() == "threshold":
                 aperture_mask = self.create_threshold_mask()
-            elif aperture_mask == "background":
+            elif aperture_mask.lower() == "background":
                 aperture_mask = ~self.create_threshold_mask(
                     threshold=0, reference_pixel=None
                 )
-            elif aperture_mask == "empty":
+            elif aperture_mask.lower() == "empty":
                 aperture_mask = np.zeros((self.shape[1], self.shape[2]), dtype=bool)
-            elif (
-                np.issubdtype(aperture_mask.dtype, np.integer)
-                and ((aperture_mask & 2) == 2).any()
-            ):
-                # Kepler and TESS pipeline style integer flags
+        elif isinstance(aperture_mask, np.ndarray):
+            # Kepler and TESS pipeline style integer flags
+            if np.issubdtype(aperture_mask.dtype, np.dtype(">i4")):
                 aperture_mask = (aperture_mask & 2) == 2
-            elif isinstance(aperture_mask.flat[0], (np.integer, np.float)):
+            elif np.issubdtype(aperture_mask.dtype, int):
+                if ((aperture_mask & 2) == 2).any():
+                    # Kepler and TESS pipeline style integer flags
+                    aperture_mask = (aperture_mask & 2) == 2
+                else:
+                    aperture_mask = aperture_mask.astype(bool)
+            elif np.issubdtype(aperture_mask.dtype, float):
                 aperture_mask = aperture_mask.astype(bool)
         self._last_aperture_mask = aperture_mask
         return aperture_mask
@@ -671,7 +688,7 @@ class TargetPixelFile(object):
 
         If the thresholding method yields multiple contiguous regions, then
         only the region closest to the (col, row) coordinate specified by
-        `reference_pixel` is returned.  For exmaple, `reference_pixel=(0, 0)`
+        `reference_pixel` is returned.  For example, `reference_pixel=(0, 0)`
         will pick the region closest to the bottom left corner.
         By default, the region closest to the center of the mask will be
         returned. If `reference_pixel=None` then all regions will be returned.
@@ -701,7 +718,7 @@ class TargetPixelFile(object):
             warnings.simplefilter("ignore")
             median_image = np.nanmedian(self.flux, axis=0)
         vals = median_image[np.isfinite(median_image)].flatten()
-        # Calculate the theshold value in flux units
+        # Calculate the threshold value in flux units
         mad_cut = (1.4826 * MAD(vals) * threshold) + np.nanmedian(median_image)
         # Create a mask containing the pixels above the threshold flux
         threshold_mask = np.nan_to_num(median_image) >= mad_cut
@@ -842,8 +859,8 @@ class TargetPixelFile(object):
             col, row = centroid_quadratic(self.flux[idx], mask=aperture_mask)
             col_centr.append(col)
             row_centr.append(row)
-        col_centr = np.asfarray(col_centr) + self.column
-        row_centr = np.asfarray(row_centr) + self.row
+        col_centr = np.asarray(col_centr, dtype=float) + self.column
+        row_centr = np.asarray(row_centr, dtype=float) + self.row
         col_centr = Quantity(col_centr, unit="pixel")
         row_centr = Quantity(row_centr, unit="pixel")
         return col_centr, row_centr
@@ -921,6 +938,7 @@ class TargetPixelFile(object):
         sigma=3,
         cache=True,
         return_mask=False,
+        show_progress=True,
     ):
         """Returns a list of asteroids or comets which affected the target pixel files.
 
@@ -931,7 +949,7 @@ class TargetPixelFile(object):
         in the brightness of the target.  They can also cause dips by moving
         through a local background aperture mask (if any is used).
 
-        The artifical spikes and dips introduced by asteroids are frequently
+        The artificial spikes and dips introduced by asteroids are frequently
         confused with stellar flares, planet transits, etc.  This method helps
         to identify false signals injects by asteroids by providing a list of
         the solar system objects (name, brightness, time) that passed in the
@@ -969,6 +987,8 @@ class TargetPixelFile(object):
             to request the search again.
         return_mask: optional, bool
             If True will return a boolean mask in time alongside the result
+        show_progress: optional, bool
+            If True will display a progress bar during the download
 
         Returns
         -------
@@ -1023,7 +1043,7 @@ class TargetPixelFile(object):
 
         if radius == None:
             radius = (
-                2 ** 0.5 * (pixel_scale * (np.max(self.shape[1:]) + 5))
+                2**0.5 * (pixel_scale * (np.max(self.shape[1:]) + 5))
             ) * u.arcsecond.to(u.deg)
 
         res = _query_solar_system_objects(
@@ -1033,9 +1053,10 @@ class TargetPixelFile(object):
             location=location,
             radius=radius,
             cache=cache,
+            show_progress=show_progress,
         )
         if return_mask:
-            return res, np.in1d(self.time.jd, res.epoch)
+            return res, np.isin(self.time.jd, res.epoch)
         return res
 
     def plot(
@@ -1083,7 +1104,7 @@ class TargetPixelFile(object):
             matplotlib's built-in stylesheets (e.g. 'ggplot').
             Lightkurve's custom stylesheet is used by default.
         kwargs : dict
-            Keywords arguments passed to `lightkurve.utils.plot_image`.
+            Keywords arguments passed to `~lightkurve.utils.plot_image`.
 
         Returns
         -------
@@ -1097,8 +1118,7 @@ class TargetPixelFile(object):
                 frame = np.argwhere(cadenceno == self.cadenceno)[0][0]
             except IndexError:
                 raise ValueError(
-                    "cadenceno {} is out of bounds, "
-                    "must be in the range {}-{}.".format(
+                    "cadenceno {} is out of bounds, must be in the range {}-{}.".format(
                         cadenceno, self.cadenceno[0], self.cadenceno[-1]
                     )
                 )
@@ -1117,8 +1137,9 @@ class TargetPixelFile(object):
             )
         except IndexError:
             raise ValueError(
-                "frame {} is out of bounds, must be in the range "
-                "0-{}.".format(frame, self.shape[0])
+                "frame {} is out of bounds, must be in the range 0-{}.".format(
+                    frame, self.shape[0]
+                )
             )
 
         # Make list of preset colour labels
@@ -1136,6 +1157,7 @@ class TargetPixelFile(object):
                 title = "Target ID: {}, Cadence: {}".format(
                     self.targetid, self.cadenceno[frame]
                 )
+
             # We subtract -0.5 because pixel coordinates refer to the middle of
             # a pixel, e.g. (col, row) = (10.0, 20.0) is a pixel center.
             img_extent = (
@@ -1144,6 +1166,15 @@ class TargetPixelFile(object):
                 self.row - 0.5,
                 self.row + self.shape[1] - 0.5,
             )
+
+            # If an axes is passed that used WCS projection, don't use img_extent
+            # This addresses lk issue #1095, where the tpf coordinates were incorrectly plotted
+
+            # By default ax=None
+            if ax != None:
+                if hasattr(ax, "wcs"):
+                    img_extent = None
+
             ax = plot_image(
                 data_to_plot,
                 ax=ax,
@@ -1158,18 +1189,24 @@ class TargetPixelFile(object):
         # Overlay the aperture mask if given
         if aperture_mask is not None:
             aperture_mask = self._parse_aperture_mask(aperture_mask)
-            for i in range(self.shape[1]):
-                for j in range(self.shape[2]):
-                    if aperture_mask[i, j]:
-                        rect = patches.Rectangle(
-                            xy=(j + self.column - 0.5, i + self.row - 0.5),
-                            width=1,
-                            height=1,
-                            color=mask_color,
-                            fill=False,
-                            hatch="//",
-                        )
-                        ax.add_patch(rect)
+            in_aperture = np.where(aperture_mask)
+            if hasattr(ax, "wcs"):
+                ap_row = in_aperture[0] - 0.5
+                ap_col = in_aperture[1] - 0.5
+            else:
+                ap_row = in_aperture[0] + self.row - 0.5
+                ap_col = in_aperture[1] + self.column - 0.5
+            for ii in range(len(ap_row)):
+                rect = patches.Rectangle(
+                    (ap_col[ii], ap_row[ii]),
+                    1,
+                    1,
+                    fill=False,
+                    hatch="//",
+                    color=mask_color,
+                )
+                ax.add_patch(rect)
+
         return ax
 
     def _to_matplotlib_animation(
@@ -1241,9 +1278,16 @@ class TargetPixelFile(object):
             # To make installing Lightkurve easier, ipython is an optional dependency,
             # because we can assume it is installed when notebook-specific features are called
             from IPython.display import HTML
-            return HTML(self._to_matplotlib_animation(step=step, interval=interval, **plot_args).to_jshtml())
+
+            return HTML(
+                self._to_matplotlib_animation(
+                    step=step, interval=interval, **plot_args
+                ).to_jshtml()
+            )
         except ModuleNotFoundError:
-            log.error("ipython needs to be installed for animate() to work (e.g., `pip install ipython`)")
+            log.error(
+                "ipython needs to be installed for animate() to work (e.g., `pip install ipython`)"
+            )
 
     def to_fits(self, output_fn=None, overwrite=False):
         """Writes the TPF to a FITS file on disk."""
@@ -1253,7 +1297,7 @@ class TargetPixelFile(object):
 
     def interact(
         self,
-        notebook_url="localhost:8888",
+        notebook_url=None,
         max_cadences=200000,
         aperture_mask="default",
         exported_filename=None,
@@ -1284,6 +1328,9 @@ class TargetPixelFile(object):
             will need to supply this value for the application to display
             properly. If no protocol is supplied in the URL, e.g. if it is
             of the form "localhost:8888", then "http" will be used.
+            For use with JupyterHub, set the environment variable LK_JUPYTERHUB_EXTERNAL_URL
+            to the public hostname of your JupyterHub and notebook_url will
+            be defined appropriately automatically.
         max_cadences : int
             Print an error message if the number of cadences shown is larger than
             this value. This limit helps keep browsers from becoming unresponsive.
@@ -1311,8 +1358,8 @@ class TargetPixelFile(object):
             before saving a fits file.  Default: None (no transform is applied).
         ylim_func: function
             A function that returns ylimits (low, high) given a LightCurve object.
-            The default is to return an expanded window around the 10-90th
-            percentile of lightcurve flux values.
+            The default is to return a window approximately around 5 sigma-clipped
+            lightcurve flux values.
 
         Examples
         --------
@@ -1333,6 +1380,8 @@ class TargetPixelFile(object):
         """
         from .interact import show_interact_widget
 
+        notebook_url = finalize_notebook_url(notebook_url)
+
         return show_interact_widget(
             self,
             notebook_url=notebook_url,
@@ -1344,7 +1393,9 @@ class TargetPixelFile(object):
             **kwargs,
         )
 
-    def interact_sky(self, notebook_url="localhost:8888", magnitude_limit=18):
+    def interact_sky(
+        self, notebook_url=None, aperture_mask="empty", magnitude_limit=18
+    ):
         """Display a Jupyter Notebook widget showing Gaia DR2 positions on top of the pixels.
 
         Parameters
@@ -1358,13 +1409,24 @@ class TargetPixelFile(object):
             will need to supply this value for the application to display
             properly. If no protocol is supplied in the URL, e.g. if it is
             of the form "localhost:8888", then "http" will be used.
+            For use with JupyterHub, set the environment variable LK_JUPYTERHUB_EXTERNAL_URL
+            to the public hostname of your JupyterHub and notebook_url will
+            be defined appropriately automatically.
+        aperture_mask : array-like, 'pipeline', 'threshold', 'default', 'background', or 'empty'
+            Highlight pixels selected by aperture_mask.
+            Default is 'empty': no pixel is highlighted.
         magnitude_limit : float
             A value to limit the results in based on Gaia Gmag. Default, 18.
         """
         from .interact import show_skyview_widget
 
+        notebook_url = finalize_notebook_url(notebook_url)
+
         return show_skyview_widget(
-            self, notebook_url=notebook_url, magnitude_limit=magnitude_limit
+            self,
+            notebook_url=notebook_url,
+            aperture_mask=aperture_mask,
+            magnitude_limit=magnitude_limit,
         )
 
     def to_corrector(self, method="pld", **kwargs):
@@ -1393,7 +1455,7 @@ class TargetPixelFile(object):
             )
         if method not in allowed_methods:
             raise ValueError(
-                ("Unrecognized method '{0}'\n" "allowed methods are: {1}").format(
+                ("Unrecognized method '{0}'\nallowed methods are: {1}").format(
                     method, allowed_methods
                 )
             )
@@ -1495,6 +1557,10 @@ class TargetPixelFile(object):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for idx, datacol in enumerate(self.hdu[1].columns):
+                # We exclude Kepler's obscure "RB_LEVEL" column from cutouts
+                # for now because it has an awkward shape
+                if datacol.name == "RB_LEVEL":
+                    continue
                 # If the column is 3D
                 if len(self.hdu[1].data[datacol.name].shape) == 3:
                     # Make a copy, trim it and change the format
@@ -1506,7 +1572,7 @@ class TargetPixelFile(object):
                     datacol._dims = datacol.array.shape[1:]
                     datacol._format = fits.column._ColumnFormat(
                         "{}{}".format(
-                            np.product(datacol.array.shape[1:]), datacol._format[-1]
+                            np.prod(datacol.array.shape[1:]), datacol._format[-1]
                         )
                     )
                     data_columns.append(datacol)
@@ -1514,9 +1580,6 @@ class TargetPixelFile(object):
                         datacol.array.shape[1:]
                     ).replace(" ", "")
                     hdr["TDIM9"] = "{}".format(datacol.array.shape[1:]).replace(" ", "")
-                    hdr["TDIM13"] = "{}".format((0, datacol.array.shape[1])).replace(
-                        " ", ""
-                    )
                 else:
                     data_columns.append(datacol)
 
@@ -1643,7 +1706,8 @@ class TargetPixelFile(object):
             elif isinstance(img, fits.HDUList):
                 hdu = img[extension]
             else:
-                hdu = fits.open(img)[extension]
+                with fits.open(img) as hdulist:
+                    hdu = hdulist[extension].copy()
             return hdu
 
         # Define a helper function to cutout images if not None
@@ -1739,7 +1803,7 @@ class TargetPixelFile(object):
                 hdu_idx["POS_CORR1"] = column_current - column_ref
                 hdu_idx["POS_CORR2"] = row_current - row_ref
 
-            # Cutout (if neccessary) and get data
+            # Cutout (if necessary) and get data
             cutout_list = [
                 _cutout_image(hdu, position, wcs_ref, size) for hdu in hdu_list
             ]
@@ -1836,8 +1900,8 @@ class TargetPixelFile(object):
             Inspired by https://github.com/noraeisner/LATTE
         corrector_func : function
             Function that accepts and returns a `~lightkurve.lightcurve.LightCurve`.
-            This function is applied to each light curve in the collection
-            prior to stitching. The default is to normalize each light curve.
+            This function is applied to each pixel's light curve.
+            The default is to return a 5 sigma-clipped light curve.
         style : str
             Path or URL to a matplotlib style file, or name of one of
             matplotlib's built-in stylesheets (e.g. 'ggplot').
@@ -1846,7 +1910,7 @@ class TargetPixelFile(object):
             Size of the markers in the lightcurve plot. For periodogram plot, it is used as the line width.
             Default: 0.5
         kwargs : dict
-            e.g. extra parameters to be passed to `lc.to_periodogram`.
+            e.g. extra parameters to be passed to `~lightkurve.LightCurve.to_periodogram`.
 
         Examples
         --------
@@ -1863,7 +1927,7 @@ class TargetPixelFile(object):
             >>>
             >>> # Variation: Customize the plot's size so that each pixel is about 1 inch by 1 inch
             >>> import matplotlib.pyplot as plt
-            >>> fig = plt.figure(figsize=(tpf.flux[0].shape[0] * 1.0, tpf.flux[0].shape[1] * 1.0))    # doctest: +SKIP
+            >>> fig = plt.figure(figsize=(tpf.flux[0].shape[1] * 1.0, tpf.flux[0].shape[0] * 1.0))    # doctest: +SKIP
             >>> tpf.plot_pixels(ax=fig.gca(), aperture_mask='pipeline')    # doctest: +SKIP
 
 
@@ -2011,7 +2075,7 @@ class KeplerTargetPixelFile(TargetPixelFile):
     with custom aperture masks, estimate centroid positions, and more.
 
     Please consult the `TargetPixelFile tutorial
-    <https://docs.lightkurve.org/tutorials/01-target-pixel-files.html>`_
+    <https://lightkurve.github.io/lightkurve/tutorials/01-target-pixel-files.html>`_
     in the online documentation for examples on using this class.
 
     Parameters
@@ -2052,28 +2116,33 @@ class KeplerTargetPixelFile(TargetPixelFile):
         super(KeplerTargetPixelFile, self).__init__(
             path, quality_bitmask=quality_bitmask, **kwargs
         )
-        self.quality_mask = KeplerQualityFlags.create_quality_mask(
-            quality_array=self.hdu[1].data["QUALITY"], bitmask=quality_bitmask
-        )
-
-        # check to make sure the correct filetype has been provided
-        filetype = detect_filetype(self.hdu)
-        if filetype == "TessTargetPixelFile":
-            warnings.warn(
-                "A TESS data product is being opened using the "
-                "`KeplerTargetPixelFile` class. "
-                "Please use `TessTargetPixelFile` instead.",
-                LightkurveWarning,
-            )
-        elif filetype is None:
-            warnings.warn(
-                "File header not recognized as Kepler or TESS " "observation.",
-                LightkurveWarning,
+        try:
+            self.quality_mask = KeplerQualityFlags.create_quality_mask(
+                quality_array=self.hdu[1].data["QUALITY"], bitmask=quality_bitmask
             )
 
-        # Use the KEPLERID keyword as the default targetid
-        if self.targetid is None:
-            self.targetid = self.get_header().get("KEPLERID")
+            # check to make sure the correct filetype has been provided
+            filetype = detect_filetype(self.hdu)
+            if filetype == "TessTargetPixelFile":
+                warnings.warn(
+                    "A TESS data product is being opened using the "
+                    "`KeplerTargetPixelFile` class. "
+                    "Please use `TessTargetPixelFile` instead.",
+                    LightkurveWarning,
+                )
+            elif filetype is None:
+                warnings.warn(
+                    "File header not recognized as Kepler or TESS observation.",
+                    LightkurveWarning,
+                )
+
+            # Use the KEPLERID keyword as the default targetid
+            if self.targetid is None:
+                self.targetid = self.get_header().get("KEPLERID")
+        except Exception as e:
+            # Cannot instantiate TargetPixelFile, close the HDU to release the file handle
+            self.hdu.close()
+            raise e
 
     def __repr__(self):
         return "KeplerTargetPixelFile Object (ID: {})".format(self.targetid)
@@ -2431,8 +2500,7 @@ class TargetPixelFileFactory(object):
         """Check the data before writing to a TPF for any obvious errors."""
         if len(self.time) != len(np.unique(self.time)):
             warnings.warn(
-                "The factory-created TPF contains cadences with "
-                "identical TIME values.",
+                "The factory-created TPF contains cadences with identical TIME values.",
                 LightkurveWarning,
             )
         if ~np.all(self.time == np.sort(self.time)):
@@ -2722,33 +2790,38 @@ class TessTargetPixelFile(TargetPixelFile):
         super(TessTargetPixelFile, self).__init__(
             path, quality_bitmask=quality_bitmask, **kwargs
         )
-        self.quality_mask = TessQualityFlags.create_quality_mask(
-            quality_array=self.hdu[1].data["QUALITY"], bitmask=quality_bitmask
-        )
-        # Early TESS releases had cadences with time=NaN (i.e. missing data)
-        # which were not flagged by a QUALITY flag yet; the line below prevents
-        # these cadences from being used. They would break most methods!
-        if (quality_bitmask != 0) and (quality_bitmask != "none"):
-            self.quality_mask &= np.isfinite(self.hdu[1].data["TIME"])
-
-        # check to make sure the correct filetype has been provided
-        filetype = detect_filetype(self.hdu)
-        if filetype == "KeplerTargetPixelFile":
-            warnings.warn(
-                "A Kepler data product is being opened using the "
-                "`TessTargetPixelFile` class. "
-                "Please use `KeplerTargetPixelFile` instead.",
-                LightkurveWarning,
+        try:
+            self.quality_mask = TessQualityFlags.create_quality_mask(
+                quality_array=self.hdu[1].data["QUALITY"], bitmask=quality_bitmask
             )
-        elif filetype is None:
-            warnings.warn(
-                "File header not recognized as Kepler or TESS " "observation.",
-                LightkurveWarning,
-            )
+            # Early TESS releases had cadences with time=NaN (i.e. missing data)
+            # which were not flagged by a QUALITY flag yet; the line below prevents
+            # these cadences from being used. They would break most methods!
+            if (quality_bitmask != 0) and (quality_bitmask != "none"):
+                self.quality_mask &= np.isfinite(self.hdu[1].data["TIME"])
 
-        # Use the TICID keyword as the default targetid
-        if self.targetid is None:
-            self.targetid = self.get_header().get("TICID")
+            # check to make sure the correct filetype has been provided
+            filetype = detect_filetype(self.hdu)
+            if filetype == "KeplerTargetPixelFile":
+                warnings.warn(
+                    "A Kepler data product is being opened using the "
+                    "`TessTargetPixelFile` class. "
+                    "Please use `KeplerTargetPixelFile` instead.",
+                    LightkurveWarning,
+                )
+            elif filetype is None:
+                warnings.warn(
+                    "File header not recognized as Kepler or TESS observation.",
+                    LightkurveWarning,
+                )
+
+            # Use the TICID keyword as the default targetid
+            if self.targetid is None:
+                self.targetid = self.get_header().get("TICID")
+        except Exception as e:
+            # Cannot instantiate TargetPixelFile, close the HDU to release the file handle
+            self.hdu.close()
+            raise e
 
     def __repr__(self):
         return "TessTargetPixelFile(TICID: {})".format(self.targetid)

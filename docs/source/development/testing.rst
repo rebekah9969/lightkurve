@@ -10,7 +10,7 @@ However, running these tests online can take a long time. Running the tests loca
 How do I run tests locally?
 ---------------------------
 
-*Lightkurve* uses `pytest <https://docs.pytest.org/en/stable/>`_ for testing.
+*Lightkurve* uses `pytest <https://docs.pytest.org/en/stable/>`_ for testing. You should have a local development environment created. See our guide on on :ref:`Installing the development environment<install-dev-env>`.
 
 First off, you need to find the directory that your *Lightkurve* installation is in. You can check this by looking at the *Lightkurve* path::
 
@@ -30,7 +30,7 @@ Note that here we're using the main branch. If you want to run the tests on a br
 
 In this directory you should find several tests labeled `test_xxx.py`. You can run a test using `pytest`. For example, to test the `lightkurve.targetpixelfile` module you would execute::
 
-    pytest test_targetpixelfile.py
+    poetry run pytest test_targetpixelfile.py
 
 
 If the tests are successful, you should see a green success message such as
@@ -42,10 +42,21 @@ If the tests are successful, you should see a green success message such as
 Why are some of the tests marked "s"/ Why are some tests skipped?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Running some of our tests requires external data, e.g. some require data to be downloaded from MAST. These tests take a little longer, and so we skip them by default. In order to run all the tests simply use::
+Running some of our tests requires external data, e.g. some require data to be downloaded from MAST. These tests take a little longer, so we skip them by default. To run all the tests simply use::
 
-    pytest test_targetpixelfile.py --remote-data
+    poetry run pytest test_targetpixelfile.py --remote-data
 
+.. note::
+    To speed up the tests, you can instruct the tests use a specific directory for data file cache, so that when the tests are re-run,
+    data files in the local directory will be used, instead of being downloaded over the network.
+
+    Specify the data file cache directory via `XDG_CACHE_HOME` environment variable. For example,
+
+    .. code-block:: bash
+
+        $ XDG_CACHE_HOME=/my_dev/lk-test-cache poetry run pytest test_targetpixelfile.py --remote-data
+
+    The data files will be cached at `/my_dev/lk-test-cache/lightkurve` in the above example.
 
 
 My tests passed, but I got warning messages
@@ -92,25 +103,19 @@ Before you open a PR to *Lightkurve*, ideally you should run these tests locally
 Can I write my own test?
 ------------------------
 
-Ideally, any PR opened to *Lightkurve* with new functionality should include some tests. These tests check that the basic functionality of your PR works. That way, if in future people create new features that break your PR, we will be alerted. Read through the `pytest` documentation and take a look at our existing tests to get an idea of how to write your own.
+Ideally, any PR opened to *Lightkurve* with new functionality should include some tests. These tests check that the basic functionality of your PR works. That way, if in the future, people create new features that break your PR, we will be alerted. Read through the `pytest` documentation and take a look at our existing tests to get an idea of how to write your own.
 
 
 I can't run any tests.
 ----------------------
 
-We run our unit tests using `pytest <https://docs.pytest.org/en/stable/>`_. This should have been installed when you installed *Lightkurve*. However, if your tests don't run, you may want to check all the test dependencies are installed by running (with `pip`)::
-
-    python -m pip install -r requirements-test.txt
-
-or equivalently if you are managing your Python environment using `conda`::
-
-    conda install --file=requirements-test.txt
+We run our unit tests using `pytest <https://docs.pytest.org/en/stable/>`_. This should have been installed when you installed *Lightkurve*. However, if your tests don't run, you may want to check all the test dependencies are installed. See our guide on on :ref:`Installing the development environment<install-dev-env>`.
 
 
-How to generate HTML report?
-----------------------------
+How to generate an HTML report?
+-------------------------------
 
-Use `pytest-html` extension. Install it by::
+Use `pytest-html <https://pytest-html.readthedocs.io/>`_ extension. Install it by::
 
     python -m pip install pytest-html
 
@@ -120,5 +125,5 @@ or in `conda`::
 
 Then you can generate an HTML report. For example::
 
-    pytest --html=build/report.html test_targetpixelfile.py
+    poetry run pytest --html=build/tests/report.html test_targetpixelfile.py
 

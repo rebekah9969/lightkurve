@@ -104,7 +104,7 @@ class SFFCorrector(RegressionCorrector):
             of input light curve time.
         breakindex : None, int or list of ints (optional)
             Optionally the user can break the light curve into sections. Set
-            break index to either an index at which to break, or list of indicies.
+            break index to either an index at which to break, or list of indices.
         degree : int
             The degree of polynomials in the splines in time and arclength. Higher
             values will create smoother splines. Default 3.
@@ -169,8 +169,14 @@ class SFFCorrector(RegressionCorrector):
                 ar = np.copy(self.arclength.value)
             else:
                 ar = np.copy(self.arclength)
+
+            # Temporary workaround for issue #1161: AstroPy v5.0
+            # Masked arrays cannot be passed to `np.isin` below
+            if hasattr(self.arclength, 'mask'):
+                ar = ar.unmasked
+
             knots = list(np.percentile(ar[a:b], np.linspace(0, 100, bins + 1)[1:-1]))
-            ar[~np.in1d(ar, ar[a:b])] = 0
+            ar[~np.isin(ar, ar[a:b])] = 0
 
             dm = spline(ar, knots=knots, degree=degree).copy()
             dm.columns = [
@@ -496,7 +502,12 @@ def _estimate_arclength(centroid_col, centroid_row):
     """
     col = centroid_col - np.nanmin(centroid_col)
     row = centroid_row - np.nanmin(centroid_row)
+    if np.all((col == 0) & (row == 0)):
+        raise RuntimeError("Arclength cannot be computed because there is no "
+                           "centroid motion. Make sure that the aperture of "
+                           "the TPF at least two pixels.")
     # Force c to be correlated not anticorrelated
     if np.polyfit(col.data, row.data, 1)[0] < 0:
         col = np.nanmax(col) - col
-    return (col ** 2 + row ** 2) ** 0.5
+    arclength = (col ** 2 + row ** 2) ** 0.5
+    return arclength 

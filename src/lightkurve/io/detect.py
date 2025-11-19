@@ -1,7 +1,6 @@
 """Provides a function to automatically detect Kepler/TESS file types."""
-from astropy.io.fits import HDUList
 from astropy.io import fits
-
+from astropy.io.fits import HDUList
 
 __all__ = ["detect_filetype"]
 
@@ -23,10 +22,13 @@ def detect_filetype(hdulist: HDUList) -> str:
         * `'K2SC'`
         * `'K2VARCAT'`
         * `'QLP'`
+        * `'GSFC-ELEANOR-LITE'`
         * `'PATHOS'`
         * `'TASOC'`
         * `'KEPSEISMIC'`
         * `'CDIPS'`
+        * `'TGLC'`
+        * `'Folded'`
 
     If the data product cannot be detected, `None` will be returned.
 
@@ -41,11 +43,19 @@ def detect_filetype(hdulist: HDUList) -> str:
         A string describing the detected filetype. If the filetype is not
         recognized, `None` will be returned.
     """
+    # The 'origin' fits header value gives institution responsible for creating the file
 
     # Is it a MIT/QLP TESS FFI Quicklook Pipeline light curve?
     # cf. http://archive.stsci.edu/hlsp/qlp
     if "mit/qlp" in hdulist[0].header.get("origin", "").lower():
         return "QLP"
+
+    # Is it a vanilla eleanor or GSFC-ELEANOR-LITE light curve?
+    if (
+        hdulist[0].header.get("LITE") is not None
+        and hdulist[0].header.get("PCORIGIN") is not None
+    ):
+        return "ELEANOR"
 
     # Is it a PATHOS TESS light curve?
     # cf. http://archive.stsci.edu/hlsp/pathos
@@ -71,13 +81,15 @@ def detect_filetype(hdulist: HDUList) -> str:
 
     # Is it a CDIPS TESS light curve?
     # cf. http://archive.stsci.edu/hlsp/cdips
-    if "cdips" in hdulist[0].header.get("ORIGIN","").lower():
+    if "cdips" in hdulist[0].header.get("ORIGIN", "").lower():
         return "CDIPS"
 
     # Is it a K2VARCAT file?
     # There are no self-identifying keywords in the header, so go by filename.
-    if "hlsp_k2varcat" in (hdulist.filename() or ""):
-        return "K2VARCAT"
+    fname = hdulist.filename() if callable(hdulist.filename) else hdulist.filename
+    if fname is not None:
+        if "hlsp_k2varcat" in fname:
+            return "K2VARCAT"
 
     # Is it a K2SC file?
     if "k2sc" in hdulist[0].header.get("creator", "").lower():
@@ -106,18 +118,31 @@ def detect_filetype(hdulist: HDUList) -> str:
     if hdulist[0].header.get("ORIGIN") == "CEA & SSI":
         return "KEPSEISMIC"
 
+    # Is it a TGLC file?
+    if hdulist[0].header.get("ORIGIN") == "UCSB/TGLC":
+        return "TGLC"
+
     # Is it an official data product?
     header = hdulist[0].header
     try:
+        # Use `creator` keyword to determine tpf or lc
+        creator = header["creator"].lower()
+        origin = header["origin"].lower()
+
+        # check if the file was a folded lightcurve, as saved by lightkurve.FoldedLightCurve().to_fits()
+        if 'folded' in creator:
+            return "Folded"
+
         # use `telescop` keyword to determine mission
-        # and `creator` to determine tpf or lc
         if "TELESCOP" in header.keys():
             telescop = header["telescop"].lower()
         else:
             # Some old custom TESS data did not define the `TELESCOP` card
             telescop = header["mission"].lower()
-        creator = header["creator"].lower()
-        origin = header["origin"].lower()
+        
+
+
+
         if telescop == "kepler":
             # Kepler TPFs will contain "TargetPixelExporterPipelineModule"
             if "targetpixel" in creator:
@@ -125,7 +150,6 @@ def detect_filetype(hdulist: HDUList) -> str:
             # Kepler LCFs will contain "FluxExporter2PipelineModule"
             elif (
                 "fluxexporter" in creator
-                or "lightcurve" in creator
                 or "lightcurve" in creator
             ):
                 return "KeplerLightCurve"
@@ -142,4 +166,6 @@ def detect_filetype(hdulist: HDUList) -> str:
     # If the TELESCOP or CREATOR keywords don't exist we expect a KeyError;
     # if one of them is Undefined we expect `.lower()` to yield an AttributeError.
     except (KeyError, AttributeError):
-        return None
+        return "generic" #Try using the generic lc reader
+    
+

@@ -1,28 +1,31 @@
-from __future__ import division, print_function
-
 from astropy.io import fits as pyfits
 from astropy.utils.data import get_pkg_data_filename
+from astropy.utils.masked import Masked
 from astropy import units as u
-from astropy.time import Time, TimeDelta
 from astropy.table import Table, Column, MaskedColumn
+from astropy.time import Time, TimeDelta
+from astropy.timeseries import aggregate_downsample
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from numpy.testing import assert_almost_equal, assert_array_equal, assert_allclose
+from numpy.testing import assert_almost_equal, assert_array_equal, assert_allclose, assert_equal
 import pytest
 import tempfile
 import warnings
 
 from lightkurve.io import read
-from lightkurve.lightcurve import LightCurve, KeplerLightCurve, TessLightCurve
+from lightkurve.lightcurve import LightCurve, KeplerLightCurve, TessLightCurve, rmse, nanstd
 from lightkurve.lightcurvefile import KeplerLightCurveFile, TessLightCurveFile
 from lightkurve.targetpixelfile import KeplerTargetPixelFile, TessTargetPixelFile
-from lightkurve.utils import LightkurveWarning, LightkurveDeprecationWarning
+from lightkurve.utils import LightkurveWarning, LightkurveDeprecationWarning, LightkurveError
 from lightkurve.search import search_lightcurve
 from lightkurve.collections import LightCurveCollection
+from lightkurve.io.generic import read_generic_lightcurve
 
 from .test_targetpixelfile import TABBY_TPF
+
+_HAS_VAR_BINS = 'time_bin_end' in aggregate_downsample.__kwdefaults__
 
 
 # 8th Quarter of Tabby's star
@@ -220,6 +223,19 @@ def test_bitmasking(quality_bitmask, answer):
     assert len(lc) == answer
 
 
+def test_hdu_property():
+    """Test to ensure lc.hdu property is in functional HDU, independent from the LightCurve object."""
+    lc = read(filename_tess)
+    with lc.hdu as hdul:
+        # 1. ensure that the hdu is fully functional, e.g., the data table can be accessed.
+        num_cadences = len(hdul[1].data)
+        assert num_cadences > 0
+
+    # 2. ensure that lc object is not tied to the life cycle of the hdulist from lc.hdu:
+    #    after hdul is closed, the lc object is still fully functional
+    assert len(lc.flux) > 0
+
+
 def test_lightcurve_fold():
     """Test the ``LightCurve.fold()`` method."""
     lc = KeplerLightCurve(
@@ -233,6 +249,8 @@ def test_lightcurve_fold():
     assert_almost_equal(fold.phase[0], -0.5, 2)
     assert_almost_equal(np.min(fold.phase), -0.5, 2)
     assert_almost_equal(np.max(fold.phase), 0.5, 2)
+    assert np.min(fold.cycle) == 0  # for #1397, case lc.fold() without epoch_time
+    assert np.max(fold.cycle) == 10
     assert fold.targetid == lc.targetid
     assert fold.label == lc.label
     assert set(lc.meta).issubset(set(fold.meta))
@@ -240,14 +258,17 @@ def test_lightcurve_fold():
     assert_array_equal(np.sort(fold.time_original), lc.time)
     assert len(fold.time_original) == len(lc.time)
     fold = lc.fold(period=1, epoch_time=-0.1)
+    assert_almost_equal(fold.phase[0], -0.5, 2)
     assert_almost_equal(fold.time[0], -0.5, 2)
     assert_almost_equal(np.min(fold.phase), -0.5, 2)
     assert_almost_equal(np.max(fold.phase), 0.5, 2)
+    assert np.min(fold.cycle) == 0
+    assert np.max(fold.cycle) == 10
     with warnings.catch_warnings():
         # `transit_midpoint` is deprecated and its use will emit a warning
         warnings.simplefilter("ignore", LightkurveWarning)
         fold = lc.fold(period=1, transit_midpoint=-0.1)
-    assert_almost_equal(fold.time[0], -0.5, 2)
+    assert_almost_equal(fold.phase[0], -0.5, 2)
     ax = fold.plot()
     assert "Phase" in ax.get_xlabel()
     ax = fold.scatter()
@@ -256,15 +277,110 @@ def test_lightcurve_fold():
     assert "Phase" in ax.get_xlabel()
     plt.close("all")
 
-    odd = fold.odd_mask
-    even = fold.even_mask
-    assert len(odd) == len(fold.time)
-    assert np.all(odd == ~even)
-    assert np.sum(odd) == np.sum(even)
     # bad transit midpoint should give a warning
     # if user tries a t0 in JD but time is in BKJD
     with pytest.warns(LightkurveWarning, match="appears to be given in JD"):
         lc.fold(10, 2456600)
+
+    # Make sure binning a phase-normalized folded lightcurve works (#1422)
+    fold = lc.fold(period=1.5, normalize_phase=False)
+    assert isinstance(fold.time, TimeDelta)
+    assert_almost_equal(np.max(fold.phase)-np.min(fold.phase), 1.5, 1)
+    assert len(fold.bin(bins=10)) == 10
+    fold = lc.fold(period=1.5, normalize_phase=True)
+    assert isinstance(lc.time, Time)
+    assert isinstance(fold.time, u.Quantity)
+    assert fold.time.unit == u.dimensionless_unscaled
+    assert_almost_equal(np.max(fold.phase)-np.min(fold.phase), 1, 1)
+    binned = fold.bin(bins=10)
+    assert len(binned) == 10
+    # ensure fold was not changed
+    assert len(fold) == 100
+    assert isinstance(fold.time, u.Quantity)
+
+    # Make sure 'copy()' works as expected
+    fold_copy = fold.copy()
+    assert_array_equal(fold.time, fold_copy.time)
+    assert_array_equal(fold.flux, fold_copy.flux)
+    # ensure the it is a deep copy
+    assert fold is not fold_copy
+    assert fold.time is not fold_copy.time
+    assert fold.flux is not fold_copy.flux
+
+
+
+
+@pytest.mark.parametrize(
+    "normalize_phase", [False, True]
+)
+def test_lightcurve_fold_odd_even_masks(normalize_phase):
+    """Test for FoldedLightCurve odd/even mask. See #1104. """
+
+    # a sine curve with 4-day period, with minimum at day 3, 7, ...
+    epoch_time, period = 3, 4
+    lc = LightCurve(
+        time=np.linspace(0, 10, 100),
+        targetid=999,
+        label="mystar",
+        meta={"CCD": 2},
+    )
+
+    lc.flux = np.sin((period * 0.75 + lc.time.value - epoch_time) * 2 * np.pi / period)
+
+    # epoch_phase should only shift how the folded lightcurve,
+    # but not the actual odd/even mask calculation
+    fold = lc.fold(period=period, epoch_time=epoch_time, epoch_phase=0.5, normalize_phase=normalize_phase)
+    odd = fold.odd_mask
+    even = fold.even_mask
+    assert len(odd) == len(fold.time)
+    assert np.all(odd == ~even)
+
+    # Check wrap_phase keyword works as expected for normalized folded lightcurves (see #1423)
+    wrapped_fold = lc.fold(period=period, epoch_time=epoch_time, epoch_phase=0.5, normalize_phase=normalize_phase, wrap_phase=0.25)
+    assert_almost_equal(wrapped_fold.phase[-1].value, 0.25, decimal = 1)
+
+
+
+    # cycle 0: time [0, 1)
+    # cycle 1: time [1, 5)
+    # cycle 2: time [5, 9)
+    # cycle 3: time [9, 10]
+    def create_expected_even(times):
+        def _mask(t):
+            if t < 1 or (5 <= t and t < 9):
+                return True
+            return False
+        return np.array([_mask(t) for t in fold.time_original.value])
+
+    def create_expected_cycle(times):
+        def _cycle(t):
+            if t < 1:
+                return 0
+            elif 1 <= t < 5:
+                return 1
+            elif 5 <= t < 9:
+                return 2
+            else:
+                return 3
+        return np.array([_cycle(t) for t in fold.time_original.value])
+
+    even_expected = create_expected_even(fold)
+    assert_array_equal(even, even_expected)
+
+    assert_array_equal(fold.cycle, create_expected_cycle(fold))
+
+    # the following plot is only useful for visualizing the result,
+    # say, when someone copies the test to Jupyter notebook to run
+    ax = lc.plot()
+    fold_e = fold[fold.even_mask]
+    ax.scatter(fold_e.time_original.value, fold_e.flux, label="actual")
+    ax.legend()
+
+    ax = lc.plot()
+    fold_e = fold[even_expected]
+    ax.scatter(fold_e.time_original.value, fold_e.flux, label="expected")
+    ax.legend()
+    plt.close("all")
 
 
 def test_lightcurve_fold_issue520():
@@ -484,6 +600,107 @@ def test_cdpp_tabby():
     assert np.abs(lc2.estimate_cdpp().value - lc.cdpp6_0) < 30
 
 
+def test_rmse():
+    """Test RMS implementation used in ``bin()``."""
+
+    # ensure RMS implementation correctly handles np.nan and masked values
+    n = np.nan  # for shorthand below
+    data = [n, 3, 4, 9, n]
+    mask = [0, 0, 0, 1, 1]
+    expected = np.sqrt((3**2 + 4**2) / 2)  # 3.535
+
+    # type astropy MaskedNDArray from MaskedQuantity, typical for SPOC TESS lightcurve
+    vals = Masked(data * u.dimensionless_unscaled, mask=mask).value
+    actual = rmse(vals)
+    assert_almost_equal(actual, expected)  # <-- will let masked value pass
+    assert np.isfinite(actual), "result should not be masked value"
+    assert np.isnan(rmse(vals[3:])), "edge case: all masked values"
+
+    vals = np.ma.MaskedArray(data=data, mask=mask)
+    actual = rmse(vals)
+    assert_almost_equal(actual, expected)  # <-- will let masked value pass
+    assert np.isfinite(actual), "result should not be masked value"
+    assert np.isnan(rmse(vals[3:])), "edge case: all masked values"
+
+    #
+    # test rmse_reduceat
+    # conceptually create 3 bins, 2 average bins, and 1 bin with all values masked
+    #
+    data2 = data + data + [4, n]
+    mask2 = mask + mask + [1, 1]
+    indices2 = [0, 5, 10]
+    expected2 = [expected, expected, n]
+
+    vals2 = Masked(data2 * u.dimensionless_unscaled, mask=mask2).value
+    actual2 = rmse.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all masked values"
+
+    vals2 = np.ma.MaskedArray(data=data2, mask=mask2)  # used by MaskedColumn
+    actual2 = rmse.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all masked values"
+
+    vals2 = np.ma.MaskedArray(data=data2, mask=mask2).filled(np.nan)  # non masked Column / Quantity
+    actual2 = rmse.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all nan"
+
+
+def test_nanstd():
+    """Test custom nanstd implementation used in ``bin()``."""
+
+    # ensure nanstd implementation correctly handles np.nan and masked values
+    n = np.nan  # for shorthand below
+    data = [n, 3, 4, 9, n]
+    mask = [0, 0, 0, 1, 1]
+    expected = np.std([3, 4])
+
+    # type astropy MaskedNDArray from MaskedQuantity, typical for SPOC TESS lightcurve
+    vals = Masked(data * u.dimensionless_unscaled, mask=mask).value
+    actual = nanstd(vals)
+    assert_almost_equal(actual, expected)  # <-- will let masked value pass
+    assert np.isfinite(actual), "result should not be masked value"
+    assert np.isnan(nanstd(vals[3:])), "edge case: all masked values"
+
+    vals = np.ma.MaskedArray(data=data, mask=mask)  # used by MaskedColumn
+    actual = nanstd(vals)
+    assert_almost_equal(actual, expected)  # <-- will let masked value pass
+    assert np.isfinite(actual), "result should not be masked value"
+    assert np.isnan(nanstd(vals[3:])), "edge case: all masked values"
+
+    #
+    # test nanstd_reduceat
+    # conceptually create 3 bins, 2 average bins, and 1 bin with all values masked
+    #
+    data2 = data + data + [4, n]
+    mask2 = mask + mask + [1, 1]
+    indices2 = [0, 5, 10]
+    expected2 = [expected, expected, n]
+
+    vals2 = Masked(data2 * u.dimensionless_unscaled, mask=mask2).value
+    actual2 = nanstd.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all masked values"
+
+    vals2 = np.ma.MaskedArray(data=data2, mask=mask2)  # used by MaskedColumn
+    actual2 = nanstd.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all masked values"
+
+    vals2 = np.ma.MaskedArray(data=data2, mask=mask2).filled(np.nan)  # non masked Column / Quantity
+    actual2 = nanstd.reduceat(vals2, indices2)
+    assert_allclose(actual2[:2], expected2[:2])  # <-- will let masked value pass
+    assert np.all(np.isfinite(actual2[:2])), "result should not be masked value"
+    assert np.isnan(actual2[2]), "edge case: the bin with all nan"
+
+
+
 def test_bin():
     """Does binning work?"""
     with warnings.catch_warnings():  # binsize is deprecated
@@ -494,8 +711,14 @@ def test_bin():
         )
         binned_lc = lc.bin(binsize=2)
         assert_allclose(binned_lc.flux, 2 * np.ones(5))
-        # stderr changed since in 2.x the first bin gets 3, the last only a single point!
-        assert_allclose(binned_lc.flux_err, np.sqrt([2./3, 1, 1, 1, 2]))
+        # stderr changed since with the initial workaround for `binsize` in 2.x
+        # the first bin gets 3, the last only a single point!
+        if _HAS_VAR_BINS:  # With Astropy 5.0 check the exact numbers again
+            # case with finite `flux_err`, binned value should be RMSE of `flux_err`
+            err_expected = np.sqrt(((2 ** 0.5) ** 2 + (2 ** 0.5) ** 2) / 2)
+            assert_allclose(binned_lc.flux_err, err_expected * np.ones(5))
+        else:
+            assert_allclose(binned_lc.flux_err, np.sqrt([2./3, 1, 1, 1, 2]))
         assert len(binned_lc.time) == 5
         with pytest.raises(TypeError):
             lc.bin(method='doesnotexist')
@@ -540,6 +763,7 @@ def test_bin_folded():
     assert np.round(binned_folded_lc.flux_err[0], 2) == 0.01
 
 
+@pytest.mark.skip  # expected to be resolved in AstroPy v5.0.1 via PR #12527
 def test_bins_kwarg():
     """Does binning work with user-defined bin placement?"""
     n_times = 3800
@@ -563,9 +787,12 @@ def test_bins_kwarg():
 
     # The `bins=`` kwarg cannot support a list or array with aggregate_downsample < #11266
     time_bin_edges = [0, 10, 20, 30, 40, 50, 60, 70, 80]
-    with pytest.raises(ValueError, match="``bins`` must be a single number."):
-        binned_lc = lc.bin(bins=time_bin_edges)
+    if not _HAS_VAR_BINS:  # Need Astropy 5.0 for those
+        with pytest.raises(ValueError, match="Sequence or method for ``bins`` requires Astropy"):
+            binned_lc = lc.bin(bins=time_bin_edges)
+    else:
         # You get N-1 bins when you enter N fenceposts
+        binned_lc = lc.bin(bins=time_bin_edges)
         assert len(binned_lc) == (len(time_bin_edges) - 1)
 
         time_bin_edges = np.arange(0, 81, 1)
@@ -577,17 +804,18 @@ def test_bins_kwarg():
         binned_lc = lc.bin(bins=time_bin_edges)
         assert len(binned_lc) == (len(time_bin_edges) - 1)
 
-    # The `bins=`` kwarg supported special values (not to be reimplemented?)
-    with pytest.raises(TypeError, match="``bins`` must have integer type."):
-        for special_bins in ["blocks", "knuth", "scott", "freedman"]:
-            binned_lc = lc.bin(bins=special_bins)
+    # The `bins=`` kwarg also supports the methods from astropy.stats.histogram
+    if not _HAS_VAR_BINS:  # Need Astropy 5.0 for those
+        with pytest.raises(ValueError, match="Sequence or method for ``bins`` requires Astropy"):
+            for special_bins in ["blocks", "knuth", "scott", "freedman"]:
+                binned_lc = lc.bin(bins=special_bins)
 
     with pytest.raises(TypeError, match="``bins`` must have integer type."):
         binned_lc = lc.bin(bins="junk_input!")
 
     # In dense bins, flux error should go down as root-N for N number of bins
     binned_lc = lc.bin(binsize=100)  # Exactly 100 samples per bin
-    assert np.isclose( lc.flux_err.mean() / np.sqrt(100), binned_lc.flux_err.mean(), rtol=0.3 )
+    assert np.isclose(lc.flux_err.mean() / np.sqrt(100), binned_lc.flux_err.mean(), rtol=0.3)
     binned_lc = lc.bin(bins=38)  # Roughly 100 samples per bin
     assert np.isclose(lc.flux_err.mean() / np.sqrt(100), binned_lc.flux_err.mean(), rtol=0.3)
 
@@ -616,11 +844,29 @@ def test_bin_quality():
         centroid_row=[0., 2, 0, 2],
     )
     binned_lc = lc.bin(binsize=2)
-    assert_allclose(binned_lc.quality, [1, 3])          # Expect bitwise or
-    # Again have to account for assymmetric allocation of first and last bin
-    assert_allclose(binned_lc.centroid_col, [1./3, 1])  # Expect mean
-    assert_allclose(binned_lc.centroid_row, [2./3, 2])  # Expect mean
 
+    if _HAS_VAR_BINS:
+        assert_allclose(binned_lc.centroid_col, [0.5, 0.5])  # Expect mean
+        assert_allclose(binned_lc.centroid_row, [1, 1])      # Expect mean
+    else:  # Again account for 3-1 allocation to first and last bin
+        assert_allclose(binned_lc.centroid_col, [1./3, 1])   # Expect mean
+        assert_allclose(binned_lc.centroid_row, [2./3, 2])   # Expect mean
+
+
+# TEMPORARILY SKIPPED, cf. https://github.com/lightkurve/lightkurve/issues/663
+@pytest.mark.xfail  # pytest.xfail("aggregate_downsample does not handle bitwise binning correctly")
+def test_binned_quality():
+    """Binning must also revise the quality and centroid columns."""
+    lc = KeplerLightCurve(
+        time=[1, 2, 3, 4],
+        flux=[1, 1, 1, 1],
+        quality=[0, 1, 2, 3],
+        centroid_col=[0., 1, 0, 1],
+        centroid_row=[0., 2, 0, 2],
+    )
+    binned_lc = lc.bin(binsize=2)
+
+    assert_allclose(binned_lc.quality, [1, 3])               # Expect bitwise or
 
 # BEGIN codes for lc.bin memory usage test
 #
@@ -678,6 +924,7 @@ def test_bin_memory_usage(dict_of_bin_args):
 #
 # END codes for lc.bin memory usage test
 
+
 def test_normalize():
     """Does the `LightCurve.normalize()` method normalize the flux?"""
     lc = LightCurve(
@@ -685,6 +932,13 @@ def test_normalize():
     )
     assert_allclose(np.median(lc.normalize().flux), 1)
     assert_allclose(np.median(lc.normalize().flux_err), 0.05 / 5)
+
+    # already in relative units
+    lc = LightCurve(time=np.arange(10), flux=np.ones(10)).normalize()
+    with warnings.catch_warnings(record=True) as warn_record:
+        lc.normalize()
+    assert len(warn_record) == 0
+    assert lc.meta["NORMALIZED"]
 
 
 def test_invalid_normalize():
@@ -704,11 +958,6 @@ def test_invalid_normalize():
     lc = LightCurve(time=np.arange(10), flux=-np.ones(10), flux_err=0.05 * np.ones(10))
     with pytest.warns(LightkurveWarning, match="negative"):
         lc.normalize()
-
-    # already in relative units
-    lc = LightCurve(time=np.arange(10), flux=np.ones(10))
-    with pytest.warns(LightkurveWarning, match="relative"):
-        lc.normalize().normalize()
 
 
 def test_to_pandas():
@@ -773,7 +1022,7 @@ def test_to_fits():
     lc = KeplerLightCurve.read(TABBY_Q8)
     hdu = lc.to_fits()
     KeplerLightCurve.read(hdu)  # Regression test for #233
-    assert type(hdu).__name__ is "HDUList"
+    assert type(hdu).__name__ == "HDUList"
     assert len(hdu) == 2
     assert hdu[0].header["EXTNAME"] == "PRIMARY"
     assert hdu[1].header["EXTNAME"] == "LIGHTCURVE"
@@ -782,8 +1031,12 @@ def test_to_fits():
     assert hdu[1].header["TTYPE3"] == "FLUX_ERR"
     hdu = LightCurve(time=[0, 1, 2, 3, 4], flux=[1, 1, 1, 1, 1]).to_fits()
 
-    # Test "round-tripping": can we read-in what we write
-    lc_new = KeplerLightCurve.read(hdu)  # Regression test for #233
+    #This should break if not KeplerLightCurve
+    with pytest.raises(KeyError):
+        lc_new = KeplerLightCurve.read(hdu)  
+
+    #Test that it works in read_generic_lightcurve
+    lc_new = read_generic_lightcurve(filename=hdu, flux_column="pdcsap_flux", quality_column="sap_quality",time_format="bkjd")
     assert hdu[0].header["EXTNAME"] == "PRIMARY"
     assert hdu[1].header["EXTNAME"] == "LIGHTCURVE"
     assert hdu[1].header["TTYPE1"] == "TIME"
@@ -819,6 +1072,49 @@ def test_to_fits():
             overwrite=True,
             extra_data={"BKG": bkg_lc.flux},
         )
+    # Test round trip saving a folded lightcurve
+    folded_hdu = read(TESS_SIM).fold(1.2*u.day).to_fits()
+    folded_lc = read(folded_hdu)
+    assert folded_lc.normalize_phase == False
+    assert folded_lc.period == 1.2
+    # Test adding additional keywords (#1369)
+    hdu = read(TESS_SIM).to_fits(period=1.2, message='Test string')
+    lc = read(hdu)
+    assert lc.period == 1.2
+    assert lc.message == 'Test string'
+    # Test reading a generic lc without TESS/Kepler information #649
+    basic_lc = LightCurve(time=[1,2,3], flux=[4,5,6])
+    basic_hdu = basic_lc.to_fits()
+    # The random data does not have time units, so this should fail if not specified
+    with pytest.raises(LightkurveError, match="Error in reading Data product"):
+        read(basic_hdu)
+    # providing time_format should allow creating a generic lk object
+    basic_lc = read(basic_hdu, time_format='jd')
+    assert (basic_lc.time.value == [1,2,3]).all()
+    assert basic_lc.time.format == 'jd'
+
+
+    
+
+
+
+def test_to_fits_flux_units_in_header():
+    # Test the units
+    hdu = LightCurve(
+        time=[0, 1, 2, 3, 4] * u.s,
+        flux=[1, 1, 1, 1, 1] * u.dimensionless_unscaled,
+        flux_err=[0.1, 0.1, 0.1, 0.1, 0.1] * u.dimensionless_unscaled,
+    ).to_fits()
+    assert "TUNIT2" not in hdu[1].header
+    assert "TUNIT3" not in hdu[1].header
+
+    hdu = LightCurve(
+        time=[0, 1, 2, 3, 4] * u.s,
+        flux=[1, 1, 1, 1, 1] * u.Jy,
+        flux_err=[0.1, 0.1, 0.1, 0.1, 0.1] * u.Jy,
+    ).to_fits()
+    assert hdu[1].header["TUNIT2"] == "Jy"
+    assert hdu[1].header["TUNIT3"] == "Jy"
 
 
 def test_astropy_time_bkjd():
@@ -915,7 +1211,6 @@ def test_remove_nans():
     lc_clean = lc.remove_nans("flux_err")
     assert_array_equal(lc_clean.flux, [])
 
-
 def test_remove_outliers():
     # Does `remove_outliers()` remove outliers?
     lc = LightCurve(time=[1, 2, 3, 4], flux=[1, 1, 1000, 1])
@@ -931,6 +1226,10 @@ def test_remove_outliers():
     lc_clean = lc.remove_outliers(sigma_lower=float("inf"), sigma_upper=1)
     assert_array_equal(lc_clean.time.value, [1, 3, 4, 5])
     assert_array_equal(lc_clean.flux, [1, 1, -1000, 1])
+    # Ensure that we can sigma clip masked arrays
+    lc = LightCurve(time=[1, 2, 3, 4, 5], flux=Masked([1, 1, 1000, 1, np.nan]))
+    lc_clean = lc.remove_outliers(sigma=1)
+    assert_array_equal(lc_clean.time.value, [1, 2, 4])
 
 
 @pytest.mark.remote_data
@@ -990,8 +1289,10 @@ def test_flatten_returns_normalized():
     )
     flat_lc, trend_lc = lc.flatten(window_length=3, polyorder=1, return_trend=True)
 
-    assert flat_lc.flux.unit is lc_flux_unit
-    assert flat_lc.flux_err.unit is lc_flux_unit
+    assert flat_lc.flux.unit == u.dimensionless_unscaled
+    assert flat_lc.flux_err.unit == u.dimensionless_unscaled
+    assert flat_lc.meta["NORMALIZED"]
+
     assert trend_lc.flux.unit is lc_flux_unit
     assert trend_lc.flux_err.unit is lc_flux_unit
 
@@ -1032,6 +1333,20 @@ def test_fill_gaps():
     assert len(lc.time) < len(nlc.time)
     assert np.any(nlc.time.value == 5)
     assert np.all(nlc.flux == 1)
+    assert np.all(np.isfinite(nlc.flux))
+
+    # Regression test for https://github.com/lightkurve/lightkurve/pull/1172
+    lc_mask = [False, False, True, False, False, False, False]
+    lc = LightCurve(
+        time=[1, 2, 3, 4, 6, 7, 8],
+        flux=Masked([1, 1, np.nan, 1, 1, 1, 1], mask=lc_mask),
+        flux_err=Masked([0, 0, np.nan, 0, 0, 0, 0], mask=lc_mask)
+    )
+    nlc = lc.fill_gaps()
+    assert len(lc.time) < len(nlc.time)
+    assert np.any(nlc.time.value == 5)
+    assert np.all(nlc.flux == 1)
+    assert np.all(nlc.flux_err == 0)
     assert np.all(np.isfinite(nlc.flux))
 
     # Because fill_gaps() uses pandas, check that it works regardless of endianness
@@ -1241,13 +1556,13 @@ def test_fold_v2():
     fld = lc.fold(period=1)
     fld2 = lc.fold(period=1 * u.day)
     assert_array_equal(fld.phase, fld2.phase)
-    assert isinstance(fld.time, TimeDelta)
+    assert isinstance(fld.phase, TimeDelta)
     fld.plot_river()
     plt.close()
 
     # Does phase normalization work?
     fld = lc.fold(period=1, normalize_phase=True)
-    assert isinstance(fld.time, u.Quantity)
+    assert isinstance(fld.phase, u.Quantity)
     fld.plot_river()
     plt.close()
 
@@ -1255,10 +1570,11 @@ def test_fold_v2():
 @pytest.mark.remote_data
 def test_combine_kepler_tess():
     """Can we append or stitch a TESS light curve to a Kepler light curve?"""
-    lc_kplr = search_lightcurve("Kepler-10", mission="Kepler", author="Kepler")[
+    # KIC 11904151: Kepler-10
+    lc_kplr = search_lightcurve("KIC 11904151", mission="Kepler", author="Kepler")[
         0
     ].download()
-    lc_tess = search_lightcurve("Kepler-10", mission="TESS", author="SPOC")[
+    lc_tess = search_lightcurve("KIC 11904151", mission="TESS", author="SPOC")[
         0
     ].download()
     # Can we use append()?
@@ -1268,6 +1584,81 @@ def test_combine_kepler_tess():
     coll = LightCurveCollection((lc_kplr, lc_tess))
     lc = coll.stitch()
     assert len(lc) == len(lc_kplr) + len(lc_tess)
+
+
+# Test initialization with `data`` in various form
+# - adapated from: https://github.com/astropy/astropy/blob/v5.0.4/astropy/timeseries/tests/test_sampled.py
+# - the goal is not to repeat the tests, but to ensure LightCurve supports the same type variants.
+
+INPUT_TIME = Time(['2016-03-22T12:30:31',
+                   '2015-01-21T12:30:32',
+                   '2016-03-22T12:30:40'])
+INPUT_RAW_TIME = [25800000.0, 25800000.1, 25800000.2]  # raw time in JD
+PLAIN_TABLE = Table([[1, 2, 11], [3, 4, 1], [1, 1, 1]], names=['flux', 'flux_err', 'c'])
+
+
+def test_initialization_with_data():
+    lc = LightCurve(time=INPUT_TIME, data=[[10, 2, 3], [4, 5, 6]], names=['flux', 'flux_err'])
+    assert_equal(lc.time.isot, INPUT_TIME.isot)
+    assert_equal(lc['flux'], [10, 2, 3])
+    assert_equal(lc['flux_err'], [4, 5, 6])
+
+
+def test_initialization_with_table():
+    lc = LightCurve(time=INPUT_TIME, data=PLAIN_TABLE)
+    assert lc.colnames == ['time', 'flux', 'flux_err', 'c']
+
+
+def test_initialization_with_time_in_data():
+    data = PLAIN_TABLE.copy()
+    data['time'] = INPUT_TIME
+
+    lc1 = LightCurve(data=data)
+
+    assert set(lc1.colnames) == set(['time', 'flux', 'flux_err', 'c'])
+    assert all(lc1.time == INPUT_TIME)
+
+    # flux / flux_err is not required in input, but will be automatically generated
+    lc2 = LightCurve(data=[[10, 2, 3], INPUT_TIME], names=['a', 'time'])
+    assert set(lc2.colnames) == set(['time', 'a', 'flux', 'flux_err'])
+    assert all(lc2.time == INPUT_TIME)
+
+    # `LightCurve.__init__()` also needs to support `data` in a list of (Time, Column/Column Mix-ins) without `names`
+    # used internally by `Table.__getitem__()``:
+    # https://github.com/astropy/astropy/blob/326435449ad8d859f1abf36800c3fb88d49c27ea/astropy/table/table.py#L1888
+    # It is not a public API code path, and is implicitly tested in `test_select_columns_as_lightcurve()`.
+
+
+def test_initialization_with_raw_time_in_data():
+    """Variant of `test_initialization_with_time_in_data() that is Lightcurve-specific.
+       Time can be raw values in default format
+    """
+    lc = LightCurve(data=[[10, 2, 3], [4, 5, 6], INPUT_RAW_TIME], names=['flux', 'flux_err', 'time'])
+    assert set(lc.colnames) == set(['time', 'flux', 'flux_err'])
+    assert_array_equal(lc.time, Time(INPUT_RAW_TIME, format=lc.time.format, scale=lc.time.scale))
+
+
+# case multiple time columns: handled by the base TimeSeries
+
+
+def test_initialization_with_ndarray():
+    # test init with ndarray does not exist in astropy `test_sampled.py`, and is added
+    # for completeness sake
+    data = np.array([(1.0, 0.2, 0),
+                     (3.0, 0.4, 4),
+                     (5.0, 0.6, 2)],
+                    dtype=[('flux', 'f8'), ('flux_err', 'f8'), ('c', 'i4')])
+    lc = LightCurve(time=INPUT_TIME, data=data)
+    assert lc.colnames == ['time', 'flux', 'flux_err', 'c']
+
+
+def test_initialization_with_time_in_ndarray():
+    data = np.array([(1.0, 0.2, 0, INPUT_RAW_TIME[0]),
+                     (3.0, 0.4, 4, INPUT_RAW_TIME[1]),
+                     (5.0, 0.6, 2, INPUT_RAW_TIME[2])],
+                    dtype=[('flux', 'f8'), ('flux_err', 'f8'), ('c', 'i4'), ('time', 'f8')])
+    lc = LightCurve(data=data)
+    assert lc.colnames == ['time', 'flux', 'flux_err', 'c']
 
 
 def test_mixed_instantiation():
@@ -1356,7 +1747,7 @@ def test_attr_access_columns():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         lc.foo = "bar"
-    with pytest.warns(None) as warn_record:
+    with warnings.catch_warnings(record=True) as warn_record:
         lc.foo = "bar2"
     assert len(warn_record) == 0
 
@@ -1387,7 +1778,7 @@ def test_attr_access_columns_consistent_update(new_col_val):
 
     # ensure the result type is the same,
     # irrespective whether the update is done via column API or attribute API
-    assert type(lc1["flux"]) is type(lc2["flux"])
+    assert isinstance(lc1["flux"], type(lc2["flux"]))
 
 
 def test_attr_access_meta():
@@ -1441,7 +1832,7 @@ def test_meta_assignment(lc):
 
     # ensure lc.meta assignment does not emit any warnings.
     meta_new = {'TSTART': 123456789.0}
-    with pytest.warns(None) as record:
+    with warnings.catch_warnings(record=True) as record:
         lc.meta = meta_new
 
     if (len(record) > 0):
@@ -1597,10 +1988,10 @@ def test_fill_gaps_after_normalization():
     ],
 )
 def test_columns_have_value_accessor(new_col_val):
-    """Ensure resulting column has  ``.value`` accessor to raw data, irrespective of type of input.
+    """Ensure resulting column has ``.value`` accessor to raw data, irrespective of type of input.
 
-    The test won't be needed once https://github.com/astropy/astropy/pull/10962 is in astropy release
-    and Lightkurve requires the correspond astropy release.
+    The test won't be needed once https://github.com/astropy/astropy/pull/10962 is in astropy
+    release and Lightkurve requires the corresponding astropy release (5.0).
     """
     expected_raw_value = new_col_val
     if hasattr(new_col_val, "value"):
@@ -1622,6 +2013,35 @@ def test_support_non_numeric_columns():
     lc["col1"] = ["a", "b", "c"]
     lc_copy = lc.copy()
     assert_array_equal(lc_copy["col1"], lc["col1"])
+
+
+def test_select_columns_as_lightcurve():
+    """Select a subset of columns as a lightcurve object. #1194 """
+    lc = LightCurve(time=np.arange(0, 12))
+    lc["flux"] = np.ones_like(lc.time, dtype="f8") - 0.01
+    lc["flux_err"] = np.ones_like(lc.time, dtype="f8") * 0.0001
+    lc["col1"] = np.zeros_like(lc.time, dtype="i4")
+    lc["col2"] = np.zeros_like(lc.time, dtype="i4")
+
+    # subset of columns including "time" works
+    lc_subset = lc['time', 'flux', 'col2']
+    # columns flux / flux_err are always there as part of a LightCurve object
+    assert set(lc_subset.colnames) == set(['time', 'flux', 'flux_err', 'col2'])
+    # the flux_err in the subset, as it is not specified requested,
+    # is one with `nan`, rather than rather than the original lc.flux_err.
+    assert np.isnan(lc_subset.flux_err).all()
+    # the subset should still be an instance of LightCurve (rather than just QTable)
+    assert(isinstance(lc_subset, type(lc)))
+
+    lc_b = lc.bin(time_bin_size=3*u.day)
+    lc_b_subset = lc_b['time', 'flux', 'flux_err', 'col1']
+    assert set(lc_b_subset.colnames) == set(['time', 'flux', 'flux_err', 'col1'])
+    assert(isinstance(lc_b_subset, type(lc_b)))
+
+    lc_f = lc.fold(period=3)
+    lc_f_subset = lc_f['time', 'flux', 'flux_err']
+    assert set(lc_f_subset.colnames) == set(['time', 'flux', 'flux_err'])
+    assert(isinstance(lc_f_subset, type(lc_f)))
 
 
 def test_timedelta():
@@ -1672,12 +2092,33 @@ def test_head_tail_truncate():
     assert lc.truncate(before=2).head(1).flux == 2
     assert lc.truncate(after=3).tail(1).flux == 3
 
+    # test optional column parameter for truncate()
+    lc["cadenceno"] = [901, 902, 903, 904, 905]
+    assert all(lc.truncate(902, 904, column="cadenceno").flux == [2, 3, 4])
+
+    # case it is a property, not a column. furthermore, it is plain numbers
+    with warnings.catch_warnings():
+        # we do want to create an attribute in this case
+        warnings.simplefilter("ignore", UserWarning)
+        lc.cycle = [11, 12, 15, 14, 13]
+    assert all(lc.truncate(12, 14, column="cycle").flux == [2, 4, 5])
 
 def test_select_flux():
     """Simple test for the `LightCurve.select_flux()` method."""
+    u_e_s = u.electron / u.second
     lc = LightCurve(data={'time': [1,2,3],
-                          'newflux': [4, 5, 6],
-                          'newflux_err': [7, 8, 9]})
+                          'flux': [2, 3, 4] * u_e_s,
+                          'flux_err': [0, 1, 2] * u_e_s,
+                          'newflux': [4, 5, 6] * u_e_s,
+                          'newflux_err': [7, 8, 9] * u_e_s,
+                          'newflux_n1': [0.9, 1, 1.1] * u.dimensionless_unscaled,  # normalized, unitless
+                          'newflux_n2': [0.9, 1, 1.1],  # normalized, no unit
+                          'newflux_n3': [4, 5, 6] * u_e_s,  # case flux and _err have different units
+                          'newflux_n3_err': [1, 2, 3] * u.percent,
+                          'newflux_n4': [4, 5, 6] * u_e_s,  # case flux and _err have different units
+                          'newflux_n4_err': [.01, .02, .03],  # normalized, no unit
+                          },
+                          )
     # Can we set flux to newflux?
     assert all(lc.select_flux("newflux").flux == lc.newflux)
     assert lc.select_flux("newflux").meta["FLUX_ORIGIN"] == "newflux"
@@ -1687,8 +2128,50 @@ def test_select_flux():
     assert all(lc.select_flux("newflux").flux_err == lc.newflux_err)
     # Can a different error column be specified?
     assert all(lc.select_flux("newflux", flux_err_column="newflux").flux_err == lc.newflux)
+    # ensure flux_err in the new lc is nan if the origin does not have it
+    assert all(np.isnan(lc.select_flux("newflux_n1")["flux_err"]))
+    assert_equal(  # https://github.com/lightkurve/lightkurve/issues/1467
+        lc.select_flux("newflux_n1")["flux_err"].unit, lc.select_flux("newflux_n1")["flux"].unit,
+        "The unit of the all-nan flux_err should be the same as that of flux [#1467]"
+    )
+    # Do inconsistent units in the selected columns raise a ValueError? [issue 1467]
+    with pytest.raises(ValueError, match="different units"):
+        lc.select_flux("newflux_n3")
+    with pytest.raises(ValueError, match="different units"):
+        lc.select_flux("newflux_n4")
     # Do invalid column names raise a ValueError?
     with pytest.raises(ValueError):
         lc.select_flux("doesnotexist")
     with pytest.raises(ValueError):
         lc.select_flux("newflux", "doesnotexist")
+    # Test for setting normalized correctly (#1091)
+    lc_n = lc.normalize(unit="percent")
+    assert lc_n.meta["NORMALIZED"]  # expected behavior of normalize, not the real test
+    assert lc_n.select_flux("newflux").meta.get("NORMALIZED", False) is False  # actual test 1
+    assert lc.meta.get("NORMALIZED", False) is False  # expected behavior, not the real test
+    assert lc.select_flux("newflux_n1").meta.get("NORMALIZED", False)  # actual test 2a, the new column is normalized
+    assert lc.select_flux("newflux_n2").meta.get("NORMALIZED", False)  # actual test 2b, the new column is normalized
+
+
+def test_transit_mask_with_quantities():
+    """Regression test for #1141."""
+    lc = LightCurve(time=range(10), flux=range(10))
+    mask_quantity = lc.create_transit_mask(period=2.9*u.day, transit_time=1*u.day, duration=1*u.day)
+    mask_no_quantity = lc.create_transit_mask(period=2.9, transit_time=1, duration=1)
+    assert all(mask_quantity == mask_no_quantity)
+
+
+@pytest.mark.skip  # expected to be resolved in AstroPy v5.0.1 via PR #12527
+def test_nbins():
+    """Regression test for #1162."""
+    lc = LightCurve(flux=[0, 0, 0])
+    # This statement raised an IndexError with Astropy v5.0rc2:
+    lc.bin(bins=2)
+
+
+def test_river_plot_with_masked_flux():
+    """Regression test for #1175."""
+    flux = Masked(np.random.normal(loc=1, scale=0.1, size=100))
+    flux_err = Masked(0.1*np.ones(100))
+    lc = LightCurve(time=np.linspace(1, 100, 100), flux=flux, flux_err=flux_err)
+    lc.plot_river(period=10.)

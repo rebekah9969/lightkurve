@@ -1,26 +1,32 @@
 """Defines tools to retrieve Kepler data from the archive at MAST."""
 from __future__ import division
-import os
+
 import glob
 import logging
+import os
 import re
 import warnings
-from requests import HTTPError
 
-from memoization import cached
 import numpy as np
-from astropy.table import join, Table, Row
+from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import ascii
-from astropy import units as u
-from astropy.utils import deprecated
+from astropy.table import Row, Table, join
 from astropy.time import Time
+from astropy.utils import deprecated
+from memoization import cached
+from requests import HTTPError
 
-from .targetpixelfile import TargetPixelFile
-from .collections import TargetPixelFileCollection, LightCurveCollection
-from .utils import suppress_stdout, LightkurveWarning, LightkurveDeprecationWarning
+from . import PACKAGEDIR, conf, config
+from .collections import LightCurveCollection, TargetPixelFileCollection
 from .io import read
-from . import PACKAGEDIR
+from .targetpixelfile import TargetPixelFile
+from .utils import (
+    LightkurveDeprecationWarning,
+    LightkurveError,
+    LightkurveWarning,
+    suppress_stdout,
+)
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +43,7 @@ __all__ = [
 AUTHOR_LINKS = {
     "Kepler": "https://archive.stsci.edu/kepler/data_products.html",
     "K2": "https://archive.stsci.edu/k2/data_products.html",
-    "SPOC": "https://heasarc.gsfc.nasa.gov/docs/tess/pipeline.html",
+    "SPOC": "https://heasarc.gsfc.nasa.gov/docs/tess/data-handling.html",
     "TESS-SPOC": "https://archive.stsci.edu/hlsp/tess-spoc",
     "QLP": "https://archive.stsci.edu/hlsp/qlp",
     "TASOC": "https://archive.stsci.edu/hlsp/tasoc",
@@ -46,7 +52,20 @@ AUTHOR_LINKS = {
     "K2SFF": "https://archive.stsci.edu/hlsp/k2sff",
     "EVEREST": "https://archive.stsci.edu/hlsp/everest",
     "TESScut": "https://mast.stsci.edu/tesscut/",
+    "GSFC-ELEANOR-LITE": "https://archive.stsci.edu/hlsp/gsfc-eleanor-lite",
+    "TGLC": "https://archive.stsci.edu/hlsp/tglc",
+    "KBONUS-BKG":"https://archive.stsci.edu/hlsp/kbonus-bkg",
 }
+
+REPR_COLUMNS_BASE = [
+    "#",
+    "mission",
+    "year",
+    "author",
+    "exptime",
+    "target_name",
+    "distance",
+]
 
 
 class SearchError(Exception):
@@ -70,6 +89,30 @@ class SearchResult(object):
     table = None
     """`~astropy.table.Table` containing the full search results returned by the MAST API."""
 
+    display_extra_columns = []
+    """A list of extra columns to be included in the default display of the search result.
+    It can be configured in a few different ways.
+
+    For example, to include ``proposal_id`` in the default display, users can set it:
+
+    1. in the user's ``lightkurve.cfg`` file::
+
+        [search]
+        # The extra comma at the end is needed for a single extra column
+        search_result_display_extra_columns = proposal_id,
+
+    2. at run time::
+
+        import lightkurve as lk
+        lk.conf.search_result_display_extra_columns = ['proposal_id']
+
+    3. for a specific `SearchResult` object instance::
+
+        result.display_extra_columns = ['proposal_id']
+
+    See :ref:`configuration <api.config>` for more information.
+    """
+
     def __init__(self, table=None):
         if table is None:
             self.table = Table()
@@ -78,6 +121,7 @@ class SearchResult(object):
             if len(table) > 0:
                 self._add_columns()
                 self._sort_table()
+        self.display_extra_columns = conf.search_result_display_extra_columns
 
     def _sort_table(self):
         """Sort the table of search results by distance, author, and filename.
@@ -90,11 +134,11 @@ class SearchResult(object):
         This ordering is not a judgement on the quality of one product vs another,
         because we love all pipelines!
         """
-        sort_priority = {"Kepler": 1, "K2": 1, "SPOC": 1, "TESS-SPOC": 2, "QLP": 3}
+        sort_priority = {"Kepler": 1, "K2": 1, "SPOC": 1, "KBONUS-BKG":2, "TESS-SPOC": 2, "QLP": 3}
         self.table["sort_order"] = [
             sort_priority.get(author, 9) for author in self.table["author"]
         ]
-        self.table.sort(["distance", "year", "mission", "sort_order", "exptime"])
+        self.table.sort(["distance", "sort_order", "author", "year", "exptime", "mission",])
 
     def _add_columns(self):
         """Adds a user-friendly index (``#``) column and adds column unit
@@ -116,24 +160,43 @@ class SearchResult(object):
             )[0]
 
     def __repr__(self, html=False):
+        def to_tess_gi_url(proposal_id):
+            cycle = int(proposal_id[1:3])
+            return f"https://heasarc.gsfc.nasa.gov/docs/tess/data/approved-programs/cycle{cycle}/{proposal_id}.txt"
+
         out = "SearchResult containing {} data products.".format(len(self.table))
         if len(self.table) == 0:
             return out
-        columns = [
-            "#",
-            "mission",
-            "year",
-            "author",
-            "exptime",
-            "target_name",
-            "distance",
-        ]
+        columns = REPR_COLUMNS_BASE
+        if self.display_extra_columns is not None:
+            columns = REPR_COLUMNS_BASE + self.display_extra_columns
+        # search_tesscut() has fewer columns, ensure we don't try to display columns that do not exist
+        columns = [c for c in columns if c in self.table.colnames]
+
         self.table["#"] = [idx for idx in range(len(self.table))]
         out += "\n\n" + "\n".join(self.table[columns].pformat(max_width=300, html=html))
         # Make sure author names show up as clickable links
         if html:
             for author, url in AUTHOR_LINKS.items():
                 out = out.replace(f">{author}<", f"><a href='{url}'>{author}</a><")
+            # special HTML formating for TESS proposal_id
+            tess_table = self.table[self.table["project"] == "TESS"]
+            if "proposal_id" in tess_table.colnames:
+                proposal_id_col = np.unique(tess_table["proposal_id"])
+            else:
+                proposal_id_col = []
+            for p_ids in proposal_id_col:
+                # for CDIPS products, proposal_id is a np MaskedConstant, not a string
+                if p_ids == "N/A" or (not isinstance(p_ids, str)):
+                    continue
+                # e.g., handle cases with multiple proposals, e.g.,  G12345_G67890
+                p_id_links = [
+                    f"""\
+<a href='{to_tess_gi_url(p_id)}'>{p_id}</a>\
+"""
+                    for p_id in p_ids.split("_")
+                ]
+                out = out.replace(f">{p_ids}<", f">{' , '.join(p_id_links)}<")
         return out
 
     def _repr_html_(self):
@@ -282,10 +345,17 @@ class SearchResult(object):
             else:
                 from astroquery.mast import Observations
 
-                log.debug("Started downloading {}.".format(table[:1]["dataURL"][0]))
-                path = Observations.download_products(
+                download_url = table[:1]["dataURI"][0]
+                log.debug("Started downloading {}.".format(download_url))
+                download_response = Observations.download_products(
                     table[:1], mrp_only=False, download_dir=download_dir
-                )["Local Path"][0]
+                )[0]
+                if download_response["Status"] != "COMPLETE":
+                    raise LightkurveError(
+                        f"Download of {download_url} failed. "
+                        f"MAST returns {download_response['Status']}: {download_response['Message']}"
+                    )
+                path = download_response["Local Path"]
                 log.debug("Finished downloading.")
             return read(path, quality_bitmask=quality_bitmask, **kwargs)
 
@@ -315,7 +385,10 @@ class SearchResult(object):
             See the :class:`KeplerQualityFlags <lightkurve.utils.KeplerQualityFlags>` or :class:`TessQualityFlags <lightkurve.utils.TessQualityFlags>` class for details on the bitmasks.
         download_dir : str, optional
             Location where the data files will be stored.
-            Defaults to "~/.lightkurve-cache" if `None` is passed.
+            If `None` is passed, the value from `cache_dir` configuration parameter is used,
+            with "~/.lightkurve/cache" as the default.
+
+            See `~lightkurve.config.get_cache_dir()` for details.
         cutout_size : int, float or tuple, optional
             Side length of cutout in pixels. Tuples should have dimensions (y, x).
             Default size is (5, 5)
@@ -336,6 +409,7 @@ class SearchResult(object):
             If the TESSCut service times out (i.e. returns HTTP status 504).
         SearchError
             If any other error occurs.
+
         """
         if len(self.table) == 0:
             warnings.warn(
@@ -386,7 +460,10 @@ class SearchResult(object):
             See the :class:`KeplerQualityFlags <lightkurve.utils.KeplerQualityFlags>` or :class:`TessQualityFlags <lightkurve.utils.TessQualityFlags>` class for details on the bitmasks.
         download_dir : str, optional
             Location where the data files will be stored.
-            Defaults to "~/.lightkurve-cache" if `None` is passed.
+            If `None` is passed, the value from `cache_dir` configuration parameter is used,
+            with "~/.lightkurve/cache" as the default.
+
+            See `~lightkurve.config.get_cache_dir()` for details.
         cutout_size : int, float or tuple, optional
             Side length of cutout in pixels. Tuples should have dimensions (y, x).
             Default size is (5, 5)
@@ -434,34 +511,7 @@ class SearchResult(object):
             return LightCurveCollection(products)
 
     def _default_download_dir(self):
-        """Returns the default path to the directory where files will be downloaded.
-
-        By default, this method will return "~/.lightkurve-cache" and create
-        this directory if it does not exist.  If the directory cannot be
-        access or created, then it returns the local directory (".").
-
-        Returns
-        -------
-        download_dir : str
-            Path to location of `mastDownload` folder where data downloaded from MAST are stored
-        """
-        download_dir = os.path.join(os.path.expanduser("~"), ".lightkurve-cache")
-        if os.path.isdir(download_dir):
-            return download_dir
-        else:
-            # if it doesn't exist, make a new cache directory
-            try:
-                os.mkdir(download_dir)
-            # downloads locally if OS error occurs
-            except OSError:
-                log.warning(
-                    "Warning: unable to create {}. "
-                    "Downloading MAST files to the current "
-                    "working directory instead.".format(download_dir)
-                )
-                download_dir = "."
-
-        return download_dir
+        return config.get_cache_dir()
 
     def _fetch_tesscut_path(self, target, sector, download_dir, cutout_size):
         """Downloads TESS FFI cutout and returns path to local file.
@@ -503,7 +553,7 @@ class SearchResult(object):
 
         # build path string name and check if it exists
         # this is necessary to ensure cutouts are not downloaded multiple times
-        sec = TesscutClass().get_sectors(coords)
+        sec = TesscutClass().get_sectors(coordinates=coords)
         sector_name = sec[sec["sector"] == sector]["sectorName"][0]
         if isinstance(cutout_size, int):
             size_str = str(int(cutout_size)) + "x" + str(int(cutout_size))
@@ -529,7 +579,7 @@ class SearchResult(object):
         # otherwise the file will be downloaded
         else:
             cutout_path = TesscutClass().download_cutouts(
-                coords, size=cutout_size, sector=sector, path=tesscut_dir
+                coordinates=coords, size=cutout_size, sector=sector, path=tesscut_dir
             )
             path = cutout_path[0][0]  # the cutoutpath already contains testcut_dir
             log.debug("Finished downloading.")
@@ -888,25 +938,41 @@ def _search_products(
     SearchResult : :class:`SearchResult` object.
     """
     if isinstance(target, int):
+        # see: https://archive.stsci.edu/search_fields.php?mission=kic10
         if (0 < target) and (target < 13161030):
             log.warning(
                 "Warning: {} may refer to a different Kepler or TESS target. "
                 "Please add the prefix 'KIC' or 'TIC' to disambiguate."
                 "".format(target)
             )
-        elif (0 < 200000000) and (target < 251813739):
+            target = str(target)
+        # see: https://archive.stsci.edu/k2/manuals/KSCI-19082-021.pdf
+        elif (target > 200000000) and (target < 252090718): 
             log.warning(
                 "Warning: {} may refer to a different K2 or TESS target. "
                 "Please add the prefix 'EPIC' or 'TIC' to disambiguate."
                 "".format(target)
             )
+            target = str(target)
+        elif target < 0:
+            log.warning(
+                "Warning: {} input value does not correspond to valid values in 'TIC' 'KIC' or 'EPIC'. "
+                "Please check target name and try again."
+                "".format(target)
+            )
+            return None
+            
+        # astroquery 0.4.11 update breaks if passing an integer, so convert to string
+        else:
+            target = f"TIC {target}"
+
 
     # Specifying quarter, campaign, or quarter should constrain the mission
-    if quarter:
+    if quarter is not None:
         mission = "Kepler"
-    if campaign:
+    if campaign is not None:
         mission = "K2"
-    if sector:
+    if sector is not None:
         mission = "TESS"
     # Ensure mission is a list
     mission = np.atleast_1d(mission).tolist()
@@ -979,7 +1045,7 @@ def _search_products(
             # K2 campaigns 9, 10, and 11 were split into two sections, which are
             # listed separately in the table with suffixes "a" and "b"
             if obs_project == "K2" and result["sequence_number"][idx] in [9, 10, 11]:
-                for half,letter in zip([1,2],['a','b']):
+                for half, letter in zip([1, 2], ["a", "b"]):
                     if f"c{tmp_seqno}{half}" in result["productFilename"][idx]:
                         obs_seqno = f"{int(tmp_seqno):02d}{letter}"
             result["mission"][idx] = "{} {} {}".format(
@@ -1082,8 +1148,8 @@ def _query_mast(
         Table detailing the available observations on MAST.
     """
     # Local astroquery import because the package is not used elsewhere
+    from astroquery.exceptions import NoResultsWarning, ResolverError
     from astroquery.mast import Observations
-    from astroquery.exceptions import ResolverError, NoResultsWarning
 
     # If passed a SkyCoord, convert it to an "ra, dec" string for MAST
     if isinstance(target, SkyCoord):
@@ -1105,15 +1171,15 @@ def _query_mast(
     exact_target_name = None
     target_lower = str(target).lower()
     # Was a Kepler target ID passed?
-    kplr_match = re.match("^(kplr|kic) ?(\d+)$", target_lower)
+    kplr_match = re.match(r"^(kplr|kic) ?(\d+)$", target_lower)
     if kplr_match:
         exact_target_name = f"kplr{kplr_match.group(2).zfill(9)}"
     # Was a K2 target ID passed?
-    ktwo_match = re.match("^(ktwo|epic) ?(\d+)$", target_lower)
+    ktwo_match = re.match(r"^(ktwo|epic) ?(\d+)$", target_lower)
     if ktwo_match:
         exact_target_name = f"ktwo{ktwo_match.group(2).zfill(9)}"
     # Was a TESS target ID passed?
-    tess_match = re.match("^(tess|tic) ?(\d+)$", target_lower)
+    tess_match = re.match(r"^(tess|tic) ?(\d+)$", target_lower)
     if tess_match:
         exact_target_name = f"{tess_match.group(2).zfill(9)}"
 
@@ -1321,9 +1387,9 @@ def _mask_by_exptime(products, exptime):
         if exptime in ["fast"]:
             mask &= products["exptime"] < 60
         elif exptime in ["short"]:
-            mask &= (products["exptime"] >= 60) & (products["exptime"] < 300)
+            mask &= (products["exptime"] >= 60) & (products["exptime"] < 200)
         elif exptime in ["long", "ffi"]:
-            mask &= products["exptime"] >= 300
+            mask &= products["exptime"] >= 200
     return mask
 
 

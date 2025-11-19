@@ -17,15 +17,17 @@ from .utils import SeismologyQuantity
 
 # Import the optional Bokeh dependency required by ``interact_echelle```,
 # or print a friendly error otherwise.
+_BOKEH_IMPORT_ERROR = None
 try:
     import bokeh  # Import bokeh first so we get an ImportError we can catch
     from bokeh.io import show, output_notebook
     from bokeh.plotting import figure
     from bokeh.models import LogColorMapper, Slider, RangeSlider, Button
     from bokeh.layouts import layout, Spacer
-except:
-    # Nice error will be raised when ``interact_echelle``` is called.
-    pass
+except Exception as e:
+    # We will print a nice error message when ``interact_echelle``` is called.
+    # the error would be raised there in case users need to diagnose problems
+    _BOKEH_IMPORT_ERROR = e
 
 log = logging.getLogger(__name__)
 
@@ -423,8 +425,8 @@ class Seismology(object):
         maximum_frequency=None,
         smooth_filter_width=0.1,
         scale="linear",
-        plot_width=490,
-        plot_height=340,
+        width=490,
+        height=340,
         title="Echelle",
     ):
         """Helper function to make the elements of the echelle diagram for bokeh plotting."""
@@ -446,8 +448,8 @@ class Seismology(object):
         )
 
         fig = figure(
-            plot_width=plot_width,
-            plot_height=plot_height,
+            width=width,
+            height=height,
             x_range=(0, 1),
             y_range=(y_f[0].value, y_f[-1].value),
             title=title,
@@ -516,19 +518,12 @@ class Seismology(object):
             properly. If no protocol is supplied in the URL, e.g. if it is
             of the form "localhost:8888", then "http" will be used.
         """
-        try:
-            import bokeh
-
-            if bokeh.__version__[0] == "0":
-                warnings.warn(
-                    "interact() requires Bokeh version 1.0 or later", LightkurveWarning
-                )
-        except ImportError:
+        if _BOKEH_IMPORT_ERROR is not None:
             log.error(
-                "The interact() tool requires the `bokeh` Python package; "
+                "The interact_echelle() tool requires the `bokeh` package; "
                 "you can install bokeh using e.g. `conda install bokeh`."
             )
-            return None
+            raise _BOKEH_IMPORT_ERROR
 
         maximum_frequency = kwargs.pop(
             "maximum_frequency", self.periodogram.frequency.max().value

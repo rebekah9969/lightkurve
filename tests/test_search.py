@@ -16,6 +16,8 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.table import Table
 
+import lightkurve as lk
+
 from lightkurve.utils import LightkurveWarning, LightkurveError
 from lightkurve.search import (
     search_lightcurve,
@@ -30,6 +32,8 @@ from lightkurve import (
     TessTargetPixelFile,
     TargetPixelFileCollection,
 )
+
+from .test_conf import use_custom_config_file, remove_custom_config
 
 
 @pytest.mark.remote_data
@@ -99,24 +103,26 @@ def test_search_split_campaigns():
 @pytest.mark.remote_data
 def test_search_lightcurve(caplog):
     # We should also be able to resolve it by its name instead of KIC ID
+    # The name Kepler-10 somehow no longer works on MAST. So we use 2MASS instead:
+    #   https://simbad.cds.unistra.fr/simbad/sim-id?Ident=%405506010&Name=Kepler-10
     assert (
-        len(search_lightcurve("Kepler-10", mission="Kepler", cadence="long").table)
+        len(search_lightcurve("2MASS J19024305+5014286", mission="Kepler", author="Kepler", cadence="long").table)
         == 15
     )
     # An invalid KIC/EPIC ID or target name should be dealt with gracefully
     search_lightcurve(-999)
-    assert "Could not resolve" in caplog.text
+    assert "correspond" in caplog.text
     search_lightcurve("DOES_NOT_EXIST (UNIT TEST)")
-    assert "Could not resolve" in caplog.text
+    assert "not resolve" in caplog.text
     # If we ask for all cadence types, there should be four Kepler files given
-    assert len(search_lightcurve("KIC 4914423", quarter=6, cadence="any").table) == 4
+    assert len(search_lightcurve("KIC 4914423", quarter=6, cadence="any", author="Kepler").table) == 4
     # ...and only one should have long cadence
-    assert len(search_lightcurve("KIC 4914423", quarter=6, cadence="long").table) == 1
+    assert len(search_lightcurve("KIC 4914423", quarter=6, cadence="long", author="Kepler").table) == 1
     # Should be able to resolve an ra/dec
-    assert len(search_lightcurve("297.5835, 40.98339", quarter=6).table) == 1
+    assert len(search_lightcurve("297.5835, 40.98339", quarter=6, author="Kepler").table) == 1
     # Should be able to resolve a SkyCoord
     c = SkyCoord("297.5835 40.98339", unit=(u.deg, u.deg))
-    search = search_lightcurve(c, quarter=6)
+    search = search_lightcurve(c, quarter=6, author="Kepler")
     assert len(search.table) == 1
     assert len(search) == 1
     # We should be able to download a light curve
@@ -211,13 +217,13 @@ def test_search_tesscut_download(caplog):
 @pytest.mark.remote_data
 def test_search_with_skycoord():
     """Can we pass both names, SkyCoord objects, and coordinate strings?"""
-    sr_name = search_targetpixelfile("Kepler-10", mission="Kepler", cadence="long")
+    sr_name = search_targetpixelfile("KIC 11904151", mission="Kepler", cadence="long")
     assert (
         len(sr_name) == 15
     )  # Kepler-10 as observed during 15 quarters in long cadence
     # Can we search using a SkyCoord objects?
     sr_skycoord = search_targetpixelfile(
-        SkyCoord.from_name("Kepler_10"), mission="Kepler", cadence="long"
+        SkyCoord.from_name("KIC 11904151"), mission="Kepler", cadence="long"
     )
     assert_array_equal(
         sr_name.table["productFilename"], sr_skycoord.table["productFilename"]
@@ -245,7 +251,7 @@ def test_search_with_skycoord():
 
 @pytest.mark.remote_data
 def test_searchresult():
-    sr = search_lightcurve("Kepler-10", mission="Kepler")
+    sr = search_lightcurve("KIC 11904151", mission="Kepler")
     assert len(sr) == len(sr.table)  # Tests SearchResult.__len__
     assert len(sr[2:7]) == 5  # Tests SearchResult.__get__
     assert len(sr[2]) == 1
@@ -256,9 +262,9 @@ def test_searchresult():
 @pytest.mark.remote_data
 def test_month():
     # In short cadence, if we specify both quarter and month
-    sr = search_targetpixelfile("Kepler-10", quarter=11, month=1, cadence="short")
+    sr = search_targetpixelfile("KIC 11904151", quarter=11, month=1, cadence="short")
     assert len(sr) == 1
-    sr = search_targetpixelfile("Kepler-10", quarter=11, month=[1, 3], cadence="short")
+    sr = search_targetpixelfile("KIC 11904151", quarter=11, month=[1, 3], cadence="short")
     assert len(sr) == 2
 
 
@@ -342,11 +348,18 @@ def test_issue_472():
 
 
 @pytest.mark.remote_data
-def test_corrupt_download_handling():
+def test_corrupt_download_handling_case_empty():
     """When a corrupt file exists in the cache, make sure the user receives
     a helpful error message.
 
-    This is a regression test for #511.
+    This is a regression test for #511 and #1184.
+
+    For case the file is truncated, see test_read.py::test_file_corrupted
+    It cannot be done easily here because on Windows,
+    a similar test would result in PermissionError when `tempfile`
+    tries to do cleanup.
+    Some low level codes (probably astropy.fits) still hold a file handle
+    of the corrupted FIS file.
     """
     with tempfile.TemporaryDirectory() as tmpdirname:
         # Pretend a corrupt file exists at the expected cache location
@@ -359,10 +372,38 @@ def test_corrupt_download_handling():
         os.makedirs(expected_dir)
         open(expected_fn, "w").close()  # create "corrupt" i.e. empty file
         with pytest.raises(LightkurveError) as err:
-            search_targetpixelfile("Kepler-10", quarter=4, cadence="long").download(
+            search_targetpixelfile("KIC 11904151", quarter=4, cadence="long").download(
                 download_dir=tmpdirname
             )
         assert "may be corrupt" in err.value.args[0]
+        assert expected_fn in err.value.args[0]
+
+
+@pytest.mark.remote_data
+def test_mast_http_error_handling(monkeypatch):
+    """Regression test for #1211; ensure downloads yields an error when MAST download result in an error."""
+    from astroquery.mast import Observations
+
+    result = search_lightcurve("TIC 273985862", mission="TESS")
+    remote_url = result.table[0]["dataURI"]
+
+    def mock_http_error_response(*args, **kwargs):
+        """Mock the `download_product()` response to simulate MAST returns HTTP error"""
+        return Table(data={
+            "Local Path": ["./mastDownload/acme_lc.fits"],
+            "Status": ["ERROR"],
+            "Message": ["HTTP Error 500: Internal Server Error"],
+            "URL": [remote_url],
+            })
+
+    monkeypatch.setattr(Observations, "download_products", mock_http_error_response)
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        # ensure the we don't hit cache so that it'll always download from MAST
+        with pytest.raises(LightkurveError) as excinfo:
+            result[0].download(download_dir=tmpdirname)
+        assert "HTTP Error 500" in str(excinfo.value)
+        assert remote_url in str(excinfo.value)
 
 
 @pytest.mark.remote_data
@@ -396,12 +437,12 @@ def test_overlapping_targets_718():
     # the requested targets, not their overlapping neighbors.
     targets = ["KIC 5112705", "KIC 10058374", "KIC 5385723"]
     for target in targets:
-        search = search_lightcurve(target, quarter=11)
+        search = search_lightcurve(target, quarter=11, author="Kepler")
         assert len(search) == 1
         assert search.target_name[0] == f"kplr{target[4:].zfill(9)}"
 
     # When using `radius=1` we should also retrieve the overlapping targets
-    search = search_lightcurve("KIC 5112705", quarter=11, radius=1 * u.arcsec)
+    search = search_lightcurve("KIC 5112705", quarter=11, author="Kepler", radius=1 * u.arcsec)
     assert len(search) > 1
 
     # Searching by `target_name` should not preven a KIC identifier to work
@@ -522,3 +563,54 @@ def test_split_k2_campaigns():
     search_c11 = search_targetpixelfile("EPIC 203830112", cadence="long", campaign=11)
     assert search_c11.table["mission"][0] == "K2 Campaign 11a"
     assert search_c11.table["mission"][1] == "K2 Campaign 11b"
+
+
+@pytest.mark.remote_data
+def test_customize_search_result_display():
+    search = search_lightcurve("TIC390021728")
+    # default display does not have proposal id
+    assert 'proposal_id' not in search.__repr__()
+
+    # custom config: has proposal_id in display
+    try:
+        use_custom_config_file("data/lightkurve_sr_cols_added.cfg")
+        # Note: here a *different* TIC is used for search to avoid the complication
+        # of caching.
+        # if the same TIC is used, the cached result would be returned, without
+        # consiering the customization specified.
+        # the TIC used is in multiple sectors, with some rows having proposal_id and some rows
+        # have none. So it's also a sanity test the for the actual proposal_id display logic.
+        search = search_lightcurve("TIC298734307")
+        assert 'proposal_id' in search.__repr__()
+    finally:
+        remove_custom_config()  # restore default to avoid side effects
+
+    # test changing config at runtime
+    try:
+        lk.conf.search_result_display_extra_columns = ['sequence_number']
+
+        search = search_lightcurve("TIC169175503")  # again use a different TIC to avoid caching complication
+        assert 'sequence_number' in search.__repr__()
+    finally:
+        lk.conf.search_result_display_extra_columns = []  # restore default to avoid side effects
+
+    # Test per-object customization
+    search.display_extra_columns = []
+    assert 'proposal_id' not in search.__repr__()
+    search.display_extra_columns = ['sequence_number', 'proposal_id']  # also support multiple columns
+    assert 'proposal_id' in search.__repr__()
+    assert 'sequence_number' in search.__repr__()
+
+
+@pytest.mark.remote_data
+def test_customize_search_result_display_case_nonexistent_column():
+
+    # Ensure that if an extra column specified are not in search result
+    # the extra column will not be shown (and it does not generate error)
+    #
+    # One typical case is that some columns are in the result of
+    # search_lightcurve() / search_targetpixelfile(), but not in those of search_tesscut()
+
+    search = search_lightcurve("TIC390021728")
+    search.display_extra_columns = ['foo_col']
+    assert 'foo_col' not in search.__repr__()

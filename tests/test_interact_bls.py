@@ -24,10 +24,6 @@ def test_malformed_notebook_url():
     with pytest.raises(ValueError) as exc:
         lc.interact_bls(notebook_url="")
     assert "Empty host value" in exc.value.args[0]
-    with pytest.raises(AttributeError) as exc:
-        lc.interact_bls(notebook_url=None)
-    assert "object has no attribute" in exc.value.args[0]
-
 
 @pytest.mark.remote_data
 @pytest.mark.skipif(bad_optional_imports, reason="requires bokeh and astropy.stats.bls")
@@ -82,7 +78,11 @@ def test_preprocess_lc():
     from lightkurve.interact_bls import _preprocess_lc_for_bls
 
     lc = KeplerLightCurve.read(KEPLER10)
-    assert np.isnan(lc.flux).any()  # ensure the test data has nan in flux
+    # As of AstroPy v5, flux is a `MaskedQuantity` in which NaNs are masked;
+    # so the next assert would not pass.
+    if not hasattr(lc.flux, "mask"):
+        # ensure the test data has nan in flux pre-Astropy v5
+        assert np.isnan(lc.flux).any()
 
     clean = _preprocess_lc_for_bls(lc)
     assert not np.isnan(clean.flux).any()  # ensure processed lc has no nan

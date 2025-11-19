@@ -4,6 +4,7 @@ import sys
 import os
 import warnings
 from functools import wraps
+import urllib
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
@@ -34,6 +35,8 @@ __all__ = [
     "bkjd_to_astropy_time",
     "btjd_to_astropy_time",
     "show_citation_instructions",
+    "finalize_notebook_url",
+    "remote_jupyter_proxy_url"
 ]
 
 
@@ -217,7 +220,7 @@ class KeplerQualityFlags(QualityFlags):
 class TessQualityFlags(QualityFlags):
     """
     This class encodes the meaning of the various TESS QUALITY bitmask flags,
-    as documented in the TESS Data Products Description Document (Ref. [1], Table 26).
+    as documented in the TESS Data Products Description Document (Ref. [1], Table 28).
 
     References
     ----------
@@ -240,17 +243,24 @@ class TessQualityFlags(QualityFlags):
     Straylight = 2048
     #: The second stray light flag is set automatically by Ames/SPOC based on background level thresholds.
     Straylight2 = 4096
+    # See TESS Science Data Products Description Document
+    PlanetSearchExclude = 8192
+    BadCalibrationExclude = 16384
+    # Set in the sector 20 data release notes
+    InsufficientTargets = 32768
 
     #: DEFAULT bitmask identifies all cadences which are definitely useless.
+    # See https://outerspace.stsci.edu/display/TESS/2.0+-+Data+Product+Overview
     DEFAULT_BITMASK = (
-        AttitudeTweak | SafeMode | CoarsePoint | EarthPoint | Desat | ManualExclude
+        AttitudeTweak | SafeMode | CoarsePoint | EarthPoint | Argabrightening | 
+        Desat | ManualExclude | ImpulsiveOutlier | BadCalibrationExclude
     )
     #: HARD bitmask is conservative and may identify cadences which are useful.
     HARD_BITMASK = (
         DEFAULT_BITMASK | ApertureCosmic | CollateralCosmic | Straylight | Straylight2
     )
     #: HARDEST bitmask identifies cadences with any flag set. Its use is not recommended.
-    HARDEST_BITMASK = 8191
+    HARDEST_BITMASK = 65535
 
     #: Dictionary which provides friendly names for the various bitmasks.
     OPTIONS = {
@@ -275,6 +285,9 @@ class TessQualityFlags(QualityFlags):
         1024: "Cosmic ray in collateral data",
         2048: "Straylight",
         4096: "Straylight2",
+        8192: "Planet Search Exclude",
+        16384: "Bad Calibration Exclude",
+        32768: "Insufficient Targets for Error Correction Exclude",
     }
 
 
@@ -296,7 +309,7 @@ def channel_to_module_output(channel):
     lookup = _get_channel_lookup_array()
     lookup[:, 0] = 0
     modout = np.where(lookup == channel)
-    return (modout[0][0], modout[1][0])
+    return modout[0][0], modout[1][0]
 
 
 def module_output_to_channel(module, output):
@@ -616,10 +629,20 @@ def centroid_quadratic(data, mask=None):
     """
     if isinstance(data, u.Quantity):
         data = data.value
+
+    if np.issubdtype(data.dtype, int):
+        # multiple code paths below require data be of float type
+        # proactively convert int to float once and for all.
+        data = data.astype(float)
+
     # Step 1: identify the patch of 3x3 pixels (z_)
     # that is centered on the brightest pixel (xx, yy)
     if mask is not None:
-        data = data * mask
+        # mask handling.
+        # Issue 1401 demonstrates that using 'data' to find the max will break when all flux is negative
+        # set masked pixels NaN (instead of 0) to resolve it.
+        data = data.copy()
+        data[~mask] = np.nan
     arg_data_max = np.nanargmax(data)
     yy, xx = np.unravel_index(arg_data_max, data.shape)
     # Make sure the 3x3 patch does not leave the TPF bounds
@@ -633,6 +656,13 @@ def centroid_quadratic(data, mask=None):
         xx = data.shape[1] - 2
 
     z_ = data[yy - 1 : yy + 2, xx - 1 : xx + 2]
+    if np.any(np.isnan(z_)):
+        # handle edge case the 3X3 patch has NaN
+        # Need some finite value for NaN pixels for the
+        # quadratic fit below: use the mean of the 3x3 patch
+        # to reduce the skew
+        z_ = z_.copy()
+        z_[np.isnan(z_)] = np.nanmean(z_)
 
     # Next, we will fit the coefficients of the bivariate quadratic with the
     # help of a design matrix (A) as defined by Eqn 20 in Vakili & Hogg
@@ -672,7 +702,7 @@ def centroid_quadratic(data, mask=None):
 
 
 def _query_solar_system_objects(
-    ra, dec, times, radius=0.1, location="kepler", cache=True
+    ra, dec, times, radius=0.1, location="kepler", cache=True, show_progress=True
 ):
     """Returns a list of asteroids/comets given a position and time.
 
@@ -693,6 +723,8 @@ def _query_solar_system_objects(
         Spacecraft location. Options include `'kepler'` and `'tess'`.
     cache : bool
         Whether to cache the search result. Default is True.
+    show_progress : bool
+        Whether to display a progress bar during the download. Default is True.
 
     Returns
     -------
@@ -718,9 +750,9 @@ def _query_solar_system_objects(
 
     df = None
     times = np.atleast_1d(times)
-    for time in tqdm(times, desc="Querying for SSOs"):
+    for time in tqdm(times, desc="Querying for SSOs", disable=~show_progress):
         url_queried = url + "EPOCH={}".format(time)
-        response = download_file(url_queried, cache=cache)
+        response = download_file(url_queried, cache=cache, show_progress=show_progress)
         if open(response).read(10) == "# Flag: -1":  # error code detected?
             raise IOError(
                 "SkyBot Solar System query failed.\n"
@@ -739,7 +771,7 @@ def _query_solar_system_objects(
             if df is None:
                 df = res
             else:
-                df = df.append(res)
+                df = pd.concat([df, res])
     if df is not None:
         df.reset_index(drop=True)
     return df
@@ -753,6 +785,7 @@ def show_citation_instructions():
     # because we can assume it is installed when notebook-specific features are called
     try:
         from IPython.display import HTML
+
         ipython_installed = True
     except ModuleNotFoundError:
         ipython_installed = False
@@ -761,7 +794,7 @@ def show_citation_instructions():
         print(__citation__)
     else:
         from pathlib import Path  # local import to speed up `import lightkurve`
-        import astroquery         # local import to speed up `import lightkurve`
+        import astroquery  # local import to speed up `import lightkurve`
 
         templatefile = Path(PACKAGEDIR, "data", "show_citation_instructions.html")
         template = open(templatefile, "r").read()
@@ -795,6 +828,65 @@ def _get_notebook_environment():
 
 def is_notebook():
     """Returns `True` if we are running in a notebook."""
-    if _get_notebook_environment() in ["jupyter", "colab"]:
-        return True
-    return False
+    return _get_notebook_environment() in ["jupyter", "colab"]
+
+
+def remote_jupyter_proxy_url(port):
+    """
+    Callable to configure Bokeh's show method when a proxy must be
+    configured.    If port is None we're asking about the URL
+    for the origin header.
+    """
+    base_url = os.environ['LK_JUPYTERHUB_EXTERNAL_URL']
+    host = urllib.parse.urlparse(base_url).netloc
+
+    # If port is None we're asking for the URL origin
+    # so return the public hostname.
+    if port is None:
+        return host
+
+    service_url_path = os.environ['JUPYTERHUB_SERVICE_PREFIX']
+    proxy_url_path = 'proxy/%d' % port
+
+    user_url = urllib.parse.urljoin(base_url, service_url_path)
+    full_url = urllib.parse.urljoin(user_url, proxy_url_path)
+    return full_url
+
+
+def finalize_notebook_url(notebook_url):
+    """Based on `notebook_url` and the environment, compute a final value for
+    notebook_url to be passed on to bokeh enabling transparent operation on JupyterHub.
+
+    See Bokeh instructions here:
+    https://docs.bokeh.org/en/latest/docs/user_guide/output/jupyter.html
+
+    This handles two aspects of Bokeh made tricky by JupyterHub, firstly
+    accessing the random Bokeh server port while behind a proxy, and second not
+    triggering CORS restrictions while accessing a second server.
+
+    A key aspect of the computed URL is the externally visible DNS name of the
+    JupyterHub, so for the case of TIKE we might have:
+
+    export LK_JUPYTERHUB_EXTERNAL_URL="https://timeseries.science.stsci.edu"
+
+    If LK_JUPYTERHUB_EXTERNAL_URL is implicitly defined by the hub environment,
+    JupyterHub users can nominally ignore the notebook_url parameter and
+    Lightkurve should "just work" as if the local default URL localhost:8888
+    was sufficient.
+
+    For example remote_jupyter_proxy_url(25346) would return the URL
+    "https://test.timeseries.science.stsci.edu/user/homer@stsci.edu/proxy/24356"
+
+    which is essentially HUB + USER_SESSION + BOKEH_PORT_IN_SESSION
+
+    The function result should be identical to past behavior unless the definition
+    of LK_JUPYTERHUB_EXTERNAL_URL indicates JupyterHub is in use.  In this case the
+    use of remote_jupyter_proxy_url is activated.   This effectively makes it the
+    JupyterHub default instead of localhost:8888.
+    """
+    if notebook_url is not None:
+        return notebook_url
+    elif os.environ.get("LK_JUPYTERHUB_EXTERNAL_URL"):
+        return remote_jupyter_proxy_url
+    else:
+        return "localhost:8888"
