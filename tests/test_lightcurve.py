@@ -21,6 +21,7 @@ from lightkurve.targetpixelfile import KeplerTargetPixelFile, TessTargetPixelFil
 from lightkurve.utils import LightkurveWarning, LightkurveDeprecationWarning, LightkurveError
 from lightkurve.search import search_lightcurve
 from lightkurve.collections import LightCurveCollection
+from lightkurve.io.generic import read_generic_lightcurve
 
 from .test_targetpixelfile import TABBY_TPF
 
@@ -1030,8 +1031,12 @@ def test_to_fits():
     assert hdu[1].header["TTYPE3"] == "FLUX_ERR"
     hdu = LightCurve(time=[0, 1, 2, 3, 4], flux=[1, 1, 1, 1, 1]).to_fits()
 
-    # Test "round-tripping": can we read-in what we write
-    lc_new = KeplerLightCurve.read(hdu)  # Regression test for #233
+    #This should break if not KeplerLightCurve
+    with pytest.raises(KeyError):
+        lc_new = KeplerLightCurve.read(hdu)  
+
+    #Test that it works in read_generic_lightcurve
+    lc_new = read_generic_lightcurve(filename=hdu, flux_column="pdcsap_flux", quality_column="sap_quality",time_format="bkjd")
     assert hdu[0].header["EXTNAME"] == "PRIMARY"
     assert hdu[1].header["EXTNAME"] == "LIGHTCURVE"
     assert hdu[1].header["TTYPE1"] == "TIME"

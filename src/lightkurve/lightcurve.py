@@ -3629,7 +3629,7 @@ class KeplerLightCurve(LightCurve):
         hdu : astropy.io.fits
             Returns an astropy.io.fits object if path is None
         """
-
+        
         kepler_specific_data = {
             "TELESCOP": "KEPLER",
             "INSTRUME": "Kepler Photometer",
@@ -3641,13 +3641,24 @@ class KeplerLightCurve(LightCurve):
             "DEC_OBJ": self.dec,
             "EQUINOX": 2000,
             "DATE-OBS": Time(self.time[0] + 2454833.0, format=("jd")).isot,
-            "SAP_QUALITY": self.quality,
+            #"SAP_QUALITY": self.quality,
         }
+
+        #RAH        
+        if hasattr(self, 'quality'):
+            kepler_specific_data["SAP_QUALITY"] = self.quality
+
+        else:
+            cols.append(
+                fits.Column(
+                    name="SAP_QUALITY", format="J", array=np.zeros(len(self.flux))
+                    )
+                )
+
         # Not every HLSP has centroid col/row information, so only pass this along if the data exists
         if hasattr(self, 'centroid_col'):
             kepler_specific_data["MOM_CENTR1"] = self.centroid_col
             kepler_specific_data["MOM_CENTR2"] = self.centroid_row
-
 
         for kw in kepler_specific_data:
             if ~np.asarray([kw.lower == k.lower() for k in extra_data]).any():
@@ -3766,7 +3777,6 @@ class TessLightCurve(LightCurve):
         }
 
 
-
         # Not every HLSP has centroid col/row information, so only pass this along if the data exists
         if hasattr(self, 'centroid_col'):
             tess_specific_data["MOM_CENTR1"] = self.centroid_col
@@ -3781,7 +3791,9 @@ class TessLightCurve(LightCurve):
 
         # We do this because the TESS file format is subtly different in the
         #    name of this column.
-        hdu[1].columns.change_name("SAP_QUALITY", "QUALITY")
+        if hasattr (self, 'SAP_QUALITY'):
+            hdu[1].columns.change_name("SAP_QUALITY", "QUALITY")
+        #hdu[1].columns.change_name("SAP_QUALITY", "QUALITY")
 
         hdu = _make_aperture_extension(hdu, aperture_mask)
 
